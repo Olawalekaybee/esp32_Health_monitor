@@ -1,0 +1,75 @@
+name: Layer 3 - SD + WiFi + Cloud Sync CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'l3-sensors-cloud/**'
+      - '.github/workflows/l3-sensors-cloud-ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'l3-sensors-cloud/**'
+
+jobs:
+  test-health-rules:
+    name: Unit tests (health_rules, native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Run native unit tests
+        working-directory: l3-sensors-cloud/main-node
+        run: pio test -e native
+
+  build-main-node:
+    name: Build main-node (esp32-s3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      # wifi_secrets.h is gitignored (real credentials), so CI builds
+      # against the checked-in .example file instead — this only proves
+      # the code compiles, never touches real Wi-Fi/cloud credentials.
+      - name: Provide placeholder wifi_secrets.h
+        working-directory: l3-sensors-cloud/main-node
+        run: |
+          if [ ! -f include/wifi_secrets.h ]; then
+            cp include/wifi_secrets.h.example include/wifi_secrets.h
+          fi
+
+      - name: Build firmware
+        working-directory: l3-sensors-cloud/main-node
+        run: pio run -e esp32-s3
+
+  build-cyd-display-node:
+    name: Build cyd-display-node (cyd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build firmware
+        working-directory: l3-sensors-cloud/cyd-display-node
+        run: pio run -e cyd
+

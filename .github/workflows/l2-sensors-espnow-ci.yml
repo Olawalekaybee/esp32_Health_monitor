@@ -1,0 +1,69 @@
+name: Layer 2 - Sensors + ESP-NOW CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'l2-sensors-espnow/**'
+      - '.github/workflows/l2-sensors-espnow-ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'l2-sensors-espnow/**'
+
+jobs:
+  test-health-rules:
+    name: Unit tests (health_rules, native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Run native unit tests
+        working-directory: l2-sensors-espnow/main-node
+        run: pio test -e native
+
+  build-main-node:
+    name: Build main-node (esp32-s3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build firmware
+        working-directory: l2-sensors-espnow/main-node
+        run: pio run -e esp32-s3
+
+  build-cyd-display-node:
+    name: Build cyd-display-node (cyd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build firmware
+        working-directory: l2-sensors-espnow/cyd-display-node
+        run: pio run -e cyd
+
+# What this CI does and does NOT prove — see l2-sensors-espnow/docs/TESTING.md
+# for the full breakdown. Short version: logic correctness and compile
+# correctness are verified automatically; physical wiring and the real
+# ESP-NOW link to hardware are not.

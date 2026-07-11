@@ -1,0 +1,15 @@
+{"ts":"2026-07-05T05:55:32.537Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"system","text":"connected COM9 @ 115200 baud"}
+{"ts":"2026-07-05T05:55:47.775Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"serial","text":"ets Jul 29 2019 12:21:46","raw":"657473204a756c20323920323031392031323a32313a3436"}
+{"ts":"2026-07-05T05:55:47.775Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"serial","text":""}
+{"ts":"2026-07-05T05:55:47.809Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"serial","text":"rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)","raw":"7273743a3078312028504f5745524f4e5f5245534554292c626f6f743a3078313320285350495f464153545f464c4153485f424f4f5429"}
+{"ts":"2026-07-05T05:55:47.809Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"serial","text":"configsip: 0, SPIWP:0xee","raw":"636f6e6669677369703a20302c2053504957503a30786565"}
+{"ts":"2026-07-05T05:55:47.809Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"serial","text":"clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00","raw":"636c6b5f6472763a307830302c715f6472763a307830302c645f6472763a307830302c6373305f6472763a307830302c68645f6472763a307830302c77705f6472763a30783030"}
+{"ts":"2026-07-05T05:55:47.809Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"serial","text":"mode:DIO, clock div:2","raw":"6d6f64653a44494f2c20636c6f636b206469763a32"}
+{"ts":"2026-07-05T05:55:47.809Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"serial","text":"load:0x3fff0030,len:1184","raw":"6c6f61643a307833666666303033302c6c656e3a31313834"}
+{"ts":"2026-07-05T05:55:47.809Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"serial","text":"load:0x40078000,len:13232","raw":"6c6f61643a307834303037383030302c6c656e3a3133323332"}
+{"ts":"2026-07-05T05:55:47.809Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"serial","text":"load:0x40080400,len:3028","raw":"6c6f61643a307834303038303430302c6c656e3a33303238"}
+{"ts":"2026-07-05T05:55:47.809Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"serial","text":"entry 0x400805e4","raw":"656e7472792030783430303830356534"}
+{"ts":"2026-07-05T05:55:48.748Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"serial","text":""}
+{"ts":"2026-07-05T05:55:48.748Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"serial","text":"=== CYD Display Node boot ===","raw":"3d3d3d2043594420446973706c6179204e6f646520626f6f74203d3d3d"}
+{"ts":"2026-07-05T05:55:49.239Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"serial","text":"[espnow] This board's MAC: F4:2D:C9:79:9E:C8","raw":"5b6573706e6f775d205468697320626f6172642773204d41433a2046343a32443a43393a37393a39453a4338"}
+{"ts":"2026-07-05T05:59:15.244Z","sessionId":"20260705_065532_COM9","port":"COM9","baudRate":115200,"source":"system","text":"disconnected TCP closed"}

@@ -1,0 +1,29 @@
+name: Layer 1 - RTOS Core CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'l1-rtos-core/**'
+      - '.github/workflows/l1-rtos-core-ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'l1-rtos-core/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build firmware (esp32-s3)
+        working-directory: l1-rtos-core
+        run: pio run -e esp32-s3

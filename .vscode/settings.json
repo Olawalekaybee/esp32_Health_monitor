@@ -1,0 +1,7 @@
+{
+    "python.analysis.extraPaths": [
+        "c:\\Users\\SHALLY COMPUTERS\\.vscode\\extensions\\altium.developer-0.4.0\\python\\SandboxProcess",
+        "c:\\Users\\SHALLY COMPUTERS\\.vscode\\extensions\\altium.developer-0.4.0\\python\\SandboxProcess\\.deps",
+        "c:\\Users\\SHALLY COMPUTERS\\.vscode\\extensions\\altium.developer-0.4.0\\python"
+    ]
+}
