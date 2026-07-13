@@ -1,8 +1,26 @@
 #include "ui.h"
 #include "theme.h"
+#include "ui_common.h"
+#include "status_icons.h"
 #include <lvgl.h>
+#include <Arduino.h>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
+
+// Built entirely from LVGL primitives (rounded rects + a circle), not
+// an image asset — this hardware has no 3D renderer, so the "3D view"
+// requested here means a stylized look (drop shadow, glow, smooth
+// animated motion) rather than actual 3D geometry. Struct declared up
+// here (rather than next to make_thermometer() below) since it needs
+// to be a complete type before the global widget instances below it.
+
+struct ThermoWidget {
+    lv_obj_t *tube;
+    lv_obj_t *mercury;
+    lv_obj_t *bulb;
+    int32_t last_fill_h;
+};
 
 // --- Widgets, created once in ui_create() ---
 static lv_obj_t *dht_value_label;
@@ -13,6 +31,19 @@ static lv_obj_t *ds_value_label;
 static lv_obj_t *ds_sub_label;
 static lv_obj_t *ds_dot;
 static lv_obj_t *ds_spark_bars[SPARK_N];
+
+// Animated thermometer per sensor card, replacing the old sparkline
+// bars — see ThermoWidget/make_thermometer below.
+static ThermoWidget dht_thermo;
+static ThermoWidget ds_thermo;
+
+// DHT-only: humidity has no equivalent on the DS18B20 (single-value
+// sensor), so this stays specific to the DHT card rather than a
+// shared pair like the thermometers above.
+static lv_obj_t *dht_humidity_arc;
+static lv_obj_t *dht_humidity_value_label;
+static int32_t dht_humidity_last_val = 0;
+
 static lv_obj_t *status_banner;
 static lv_obj_t *status_label;
 static lv_obj_t *reason_label;
@@ -29,6 +60,49 @@ static lv_obj_t *wifi_dot;
 static lv_obj_t *sd_dot;
 static lv_obj_t *cloud_dot;
 
+// Layer 6 (touch/settings): three screens total. main_screen is the
+// existing dashboard (ui_create() still builds it first, unchanged).
+// settings_screen and detail_screen are new, built at the end of
+// ui_create(), and are otherwise idle/invisible until navigated to.
+static lv_obj_t *main_screen;
+static lv_obj_t *settings_screen;
+static lv_obj_t *detail_screen;
+
+static bool ticker_paused = false;
+
+// Settings screen: one dot + one checkmark per backend option row.
+// The dot mirrors the main dashboard's status-dot language; the
+// checkmark is the clearer "this one is actually active" signal,
+// shown/hidden rather than just recolored.
+static lv_obj_t *settings_option_dot[3];
+static lv_obj_t *settings_option_check[3];
+static lv_obj_t *settings_active_label;
+
+// Detail screen: a real LVGL arc gauge (not a styled plain object)
+// plus a real LVGL chart for history — replacing the earlier
+// hand-rolled bar widgets with LVGL's own widgets for both.
+//
+// Two different widget sets share this one screen, shown/hidden based
+// on detail_which: DS18B20 (single value, no humidity) uses
+// detail_arc + detail_chart below; DHT22 (has both temp AND humidity)
+// uses the separate detail_dht_* pair instead, side by side, since a
+// single arc was only ever showing temperature and never had anywhere
+// to show humidity at all.
+static lv_obj_t *detail_title_label;
+static lv_obj_t *detail_value_label;
+static lv_obj_t *detail_arc;
+static lv_obj_t *detail_chart;
+static lv_chart_series_t *detail_chart_series;
+
+static lv_obj_t *detail_dht_temp_arc;
+static lv_obj_t *detail_dht_temp_value_label;
+static lv_obj_t *detail_dht_temp_caption;
+static lv_obj_t *detail_dht_humidity_arc;
+static lv_obj_t *detail_dht_humidity_value_label;
+static lv_obj_t *detail_dht_humidity_caption;
+
+static int detail_which = 0; // 0 = DHT22, 1 = DS18B20 — set when a card is tapped
+
 // Rolling history for each card's sparkline, oldest first.
 static float dht_temp_history[SPARK_N];
 static float ds_temp_history[SPARK_N];
@@ -40,6 +114,19 @@ static const char *statusToStr(uint8_t s) {
         case 1: return "WARNING";
         case 2: return "FAULT";
         default: return "UNKNOWN";
+    }
+}
+
+// Layer 6 (touch/settings): mirrors main-node's CloudBackendId naming
+// (see cloud_dispatch.h over there) — duplicated rather than shared,
+// since these are two separate PlatformIO projects and this is just
+// three strings, not worth a shared header for.
+static const char *cloudBackendName(uint8_t id) {
+    switch (id) {
+        case 0: return "Google Sheets";
+        case 1: return "Firebase";
+        case 2: return "AWS";
+        default: return "Unknown";
     }
 }
 
@@ -66,106 +153,127 @@ static lv_color_t statusToBgColor(uint8_t s) {
 // theme disabled globally (see main.cpp's lv_display_set_theme call)
 // this is mostly a safety net, but keeps every widget's appearance
 // fully explicit and predictable.
-static void bare(lv_obj_t *obj) {
-    lv_obj_remove_style_all(obj);
-    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+// bare(), make_status_dot(), set_dot_color() now live in ui_common.h/.cpp.
+// make_side_panel()/make_status_icon_badge() now live in status_icons.h/.cpp,
+// using real LV_SYMBOL_* icons instead of the wrapped text labels this
+// used to have — see status_icons.h for why.
+
+// ============================================================
+// Animated "thermometer" — a vertical tube, a bulb, and an inner
+// "mercury" fill whose height animates smoothly toward each new
+// reading. Built entirely from LVGL primitives (rounded rects + a
+// circle), not an image asset — this hardware has no 3D renderer, so
+// "3D view" here means a stylized look (drop shadow, glow, smooth
+// motion) rather than actual 3D geometry. Worth being upfront about
+// that distinction rather than implying more than LVGL can do.
+// (ThermoWidget struct itself is declared near the top of the file,
+// alongside the global widget instances that need it as a complete type.)
+// ============================================================
+
+static void mercury_height_anim_cb(void *var, int32_t value) {
+    lv_obj_t *mercury = (lv_obj_t *)var;
+    lv_obj_set_height(mercury, value);
+    // Re-anchor to the tube's bottom every frame so it visibly "fills
+    // up" rather than growing down from a fixed top edge.
+    lv_obj_align(mercury, LV_ALIGN_BOTTOM_MID, 0, -2);
 }
 
-// Small colored dot used as a per-sensor status indicator, independent
-// of the numeric value color — lets you tell "reading is stale/failing"
-// apart from "reading is just cold" at a glance.
-static lv_obj_t *make_status_dot(lv_obj_t *parent) {
-    lv_obj_t *dot = lv_obj_create(parent);
-    bare(dot);
-    lv_obj_set_size(dot, 8, 8);
-    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(dot, lv_palette_main(LV_PALETTE_GREY), 0);
-    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-    // Soft glow behind the dot, color-matched whenever set_dot_color() runs.
-    lv_obj_set_style_shadow_width(dot, 10, 0);
-    lv_obj_set_style_shadow_spread(dot, 2, 0);
-    lv_obj_set_style_shadow_color(dot, lv_palette_main(LV_PALETTE_GREY), 0);
-    lv_obj_set_style_shadow_opa(dot, LV_OPA_50, 0);
-    return dot;
+static void animate_mercury_to(lv_obj_t *mercury, int32_t from, int32_t to, uint32_t duration_ms) {
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, mercury);
+    lv_anim_set_exec_cb(&a, mercury_height_anim_cb);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_time(&a, duration_ms);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
 }
 
-// Sets a dot's fill AND its glow color together, so the glow always
-// matches whatever status color the dot is showing.
-static void set_dot_color(lv_obj_t *dot, lv_color_t color) {
-    lv_obj_set_style_bg_color(dot, color, 0);
-    lv_obj_set_style_shadow_color(dot, color, 0);
+static ThermoWidget make_thermometer(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
+                                       lv_coord_t tube_w, lv_coord_t tube_h, lv_coord_t bulb_d) {
+    ThermoWidget t = {};
+
+    t.tube = lv_obj_create(parent);
+    bare(t.tube);
+    lv_obj_set_size(t.tube, tube_w, tube_h);
+    lv_obj_set_pos(t.tube, x, y);
+    lv_obj_set_style_radius(t.tube, tube_w / 2, 0);
+    lv_obj_set_style_bg_color(t.tube, lv_color_hex(0x0d1117), 0);
+    lv_obj_set_style_bg_opa(t.tube, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(t.tube, 1, 0);
+    lv_obj_set_style_border_color(t.tube, COLOR_CARD_BORDER, 0);
+
+    t.mercury = lv_obj_create(t.tube);
+    bare(t.mercury);
+    lv_coord_t mw = tube_w - 6;
+    lv_obj_set_size(t.mercury, mw, 2);
+    lv_obj_align(t.mercury, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_style_radius(t.mercury, mw / 2, 0);
+    lv_obj_set_style_bg_color(t.mercury, lv_palette_main(LV_PALETTE_CYAN), 0);
+    lv_obj_set_style_bg_opa(t.mercury, LV_OPA_COVER, 0);
+
+    t.bulb = lv_obj_create(parent);
+    bare(t.bulb);
+    lv_obj_set_size(t.bulb, bulb_d, bulb_d);
+    lv_obj_set_pos(t.bulb, x + tube_w / 2 - bulb_d / 2, y + tube_h - bulb_d / 2 - 2);
+    lv_obj_set_style_radius(t.bulb, bulb_d / 2, 0);
+    lv_obj_set_style_bg_color(t.bulb, lv_palette_main(LV_PALETTE_CYAN), 0);
+    lv_obj_set_style_bg_opa(t.bulb, LV_OPA_COVER, 0);
+    // Glow + gentle pulse for a bit of life and visual depth, reusing
+    // the same shadow-pulse mechanic the status dots already use.
+    lv_obj_set_style_shadow_width(t.bulb, 10, 0);
+    lv_obj_set_style_shadow_color(t.bulb, lv_palette_main(LV_PALETTE_CYAN), 0);
+    lv_obj_set_style_shadow_opa(t.bulb, LV_OPA_40, 0);
+    start_pulse(t.bulb, 1200);
+
+    t.last_fill_h = 2;
+    return t;
 }
 
-// Layer 6: compact pill badge for the system-status strip — same
-// visual language as the existing title-bar comms badge (dark fill,
-// thin border, rounded ends, status dot + fixed label), factored out
-// here since we now need three of them side by side instead of one.
-// The label text never changes (e.g. always "WiFi") — only the dot's
-// color reflects live status, matching how the comms badge already
-// behaves.
-static lv_obj_t *make_mini_badge(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
-                                   lv_coord_t w, lv_coord_t h, const char *label_text) {
-    lv_obj_t *badge = lv_obj_create(parent);
-    bare(badge);
-    lv_obj_set_size(badge, w, h);
-    lv_obj_set_pos(badge, x, y);
-    lv_obj_set_style_bg_color(badge, lv_color_hex(0x161b22), 0);
-    lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(badge, h / 2, 0);
-    lv_obj_set_style_border_width(badge, 1, 0);
-    lv_obj_set_style_border_color(badge, COLOR_CARD_BORDER, 0);
+static void set_thermometer_value(ThermoWidget &t, float value, bool ok,
+                                    float min_val, float max_val, lv_coord_t tube_h) {
+    lv_color_t color = ok ? lv_palette_main(LV_PALETTE_CYAN) : lv_palette_main(LV_PALETTE_RED);
+    lv_obj_set_style_bg_color(t.mercury, color, 0);
+    lv_obj_set_style_bg_color(t.bulb, color, 0);
+    lv_obj_set_style_shadow_color(t.bulb, color, 0);
 
-    lv_obj_t *dot = make_status_dot(badge);
-    lv_obj_align(dot, LV_ALIGN_LEFT_MID, 6, 0);
+    // A failed read has no real value to show — hold the mercury at
+    // its floor rather than animating toward a NaN-derived height.
+    int32_t target_h = 2;
+    if (ok) {
+        float clamped = value;
+        if (clamped < min_val) clamped = min_val;
+        if (clamped > max_val) clamped = max_val;
+        float norm = (clamped - min_val) / (max_val - min_val);
+        target_h = 2 + (int32_t)(norm * (tube_h - 8));
+    }
 
-    lv_obj_t *label = lv_label_create(badge);
-    lv_label_set_text(label, label_text);
-    lv_obj_set_style_text_font(label, FONT_LABEL, 0);
-    lv_obj_set_style_text_color(label, COLOR_TEXT_MUTED, 0);
-    lv_obj_align_to(label, dot, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
-
-    return dot; // caller only ever needs to recolor the dot afterward
+    animate_mercury_to(t.mercury, t.last_fill_h, target_h, 400);
+    t.last_fill_h = target_h;
 }
 
-// Small angular "target-lock" bracket — the tactical HUD marks visible
-// in sci-fi interface reference art. Cheap to render (two thin flat
-// rectangles, no radius/shadow). Always attached to `parent` using
-// ABSOLUTE coordinates (not relative to any padded content area) —
-// pass the screen as parent and the panel's own on-screen x/y/w/h, so
-// there's no ambiguity about padding offsetting the bracket inward.
-static void add_corner_bracket(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
-                                bool right, bool bottom, lv_color_t color) {
-    const int len = 10;
-    const int thick = 2;
-    lv_coord_t hx = right ? x - len : x;
-    lv_coord_t hy = bottom ? y - thick : y;
-    lv_coord_t vx = right ? x - thick : x;
-    lv_coord_t vy = bottom ? y - len : y;
-
-    lv_obj_t *h = lv_obj_create(parent);
-    bare(h);
-    lv_obj_set_size(h, len, thick);
-    lv_obj_set_pos(h, hx, hy);
-    lv_obj_set_style_bg_color(h, color, 0);
-    lv_obj_set_style_bg_opa(h, LV_OPA_COVER, 0);
-
-    lv_obj_t *v = lv_obj_create(parent);
-    bare(v);
-    lv_obj_set_size(v, thick, len);
-    lv_obj_set_pos(v, vx, vy);
-    lv_obj_set_style_bg_color(v, color, 0);
-    lv_obj_set_style_bg_opa(v, LV_OPA_COVER, 0);
+// ============================================================
+// Animated humidity gauge — a small circular arc (real LVGL widget,
+// same pattern as the Detail screen's temperature arc) with the
+// percentage centered inside it, and its value transition animated
+// rather than snapping instantly.
+// ============================================================
+static void arc_value_anim_cb(void *var, int32_t value) {
+    lv_arc_set_value((lv_obj_t *)var, value);
 }
 
-// All 4 corners of a w x h area whose top-left sits at (ox, oy) in
-// `parent`'s absolute coordinate space.
-static void add_corner_brackets(lv_obj_t *parent, lv_coord_t ox, lv_coord_t oy,
-                                 lv_coord_t w, lv_coord_t h, lv_color_t color) {
-    add_corner_bracket(parent, ox,     oy,     false, false, color);
-    add_corner_bracket(parent, ox + w, oy,     true,  false, color);
-    add_corner_bracket(parent, ox,     oy + h, false, true,  color);
-    add_corner_bracket(parent, ox + w, oy + h, true,  true,  color);
+static void animate_arc_to(lv_obj_t *arc, int32_t from, int32_t to, uint32_t duration_ms) {
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, arc);
+    lv_anim_set_exec_cb(&a, arc_value_anim_cb);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_time(&a, duration_ms);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
 }
+
+// add_corner_brackets() now lives in ui_common.h/.cpp.
 
 // --- Sparkline: a compact bar-style trend graph, built from plain
 //     rectangles (not LVGL's lv_chart widget) so it doesn't depend on
@@ -218,67 +326,48 @@ static void push_history(float *history, float value) {
     history[SPARK_N - 1] = value;
 }
 
-// --- Animations: a soft "breathing" pulse, a glowing accent line, and
-//     a one-shot border "flash" pulse on each data refresh — for a
-//     more alive, futuristic feel. Kept intentionally modest — this
-//     hardware has shown SPI/render sensitivity earlier in this
-//     project, so heavier effects (full-screen sweeps, particles)
-//     aren't worth the risk of stutter for a cosmetic upgrade. ---
+// add_press_feedback() now lives in ui_common.h/.cpp.
 
-static void opa_pulse_anim_cb(void *var, int32_t value) {
-    lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)value, 0);
+// Shared header for the Settings and Detail screens: the ENTIRE bar
+// is the back-tap target, not a small corner button — deliberately
+// generous (320x32 = ~5x the area of the original 60x32 corner
+// button) so touch accuracy near a screen edge can't be the reason it
+// doesn't register, whatever the original cause turns out to be.
+// out_title_label is optional — Detail screen needs to update its
+// title text per-sensor later; Settings screen's title never changes.
+static lv_obj_t *make_nav_header(lv_obj_t *parent, const char *title,
+                                   lv_event_cb_t back_cb, lv_obj_t **out_title_label = nullptr) {
+    lv_obj_t *header = lv_obj_create(parent);
+    bare(header);
+    lv_obj_set_size(header, 320, TITLE_BAR_H);
+    lv_obj_set_pos(header, 0, 0);
+    lv_obj_set_style_bg_color(header, COLOR_TITLE_BAR, 0);
+    lv_obj_set_style_bg_opa(header, LV_OPA_COVER, 0);
+    lv_obj_add_flag(header, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(header, back_cb, LV_EVENT_CLICKED, NULL);
+    add_press_feedback(header, lv_color_hex(0x232a35));
+
+    lv_obj_t *back_label = lv_label_create(header);
+    lv_label_set_text(back_label, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_font(back_label, FONT_LABEL, 0);
+    lv_obj_set_style_text_color(back_label, lv_palette_lighten(LV_PALETTE_GREY, 2), 0);
+    lv_obj_align(back_label, LV_ALIGN_LEFT_MID, 10, 0);
+
+    lv_obj_t *title_label = lv_label_create(header);
+    lv_label_set_text(title_label, title);
+    lv_obj_set_style_text_font(title_label, FONT_LABEL, 0);
+    lv_obj_set_style_text_color(title_label, COLOR_TEXT_PRIMARY, 0);
+    lv_obj_set_style_text_letter_space(title_label, 1, 0);
+    lv_obj_align(title_label, LV_ALIGN_RIGHT_MID, -10, 0);
+
+    if (out_title_label) {
+        *out_title_label = title_label;
+    }
+    return header;
 }
 
-static void start_pulse(lv_obj_t *obj, uint32_t half_cycle_ms) {
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, obj);
-    lv_anim_set_exec_cb(&a, opa_pulse_anim_cb);
-    lv_anim_set_values(&a, LV_OPA_40, LV_OPA_COVER);
-    lv_anim_set_time(&a, half_cycle_ms);
-    lv_anim_set_playback_time(&a, half_cycle_ms);
-    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
-    lv_anim_start(&a);
-}
-
-static void accent_glow_anim_cb(void *var, int32_t value) {
-    lv_color_t dim = lv_palette_darken(LV_PALETTE_CYAN, 2);
-    lv_color_t bright = lv_palette_main(LV_PALETTE_CYAN);
-    lv_obj_set_style_bg_color((lv_obj_t *)var, lv_color_mix(bright, dim, (uint8_t)value), 0);
-}
-
-static void start_accent_glow(lv_obj_t *obj) {
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, obj);
-    lv_anim_set_exec_cb(&a, accent_glow_anim_cb);
-    lv_anim_set_values(&a, 0, 255);
-    lv_anim_set_time(&a, 1500);
-    lv_anim_set_playback_time(&a, 1500);
-    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
-    lv_anim_start(&a);
-}
-
-static void border_flash_anim_cb(void *var, int32_t value) {
-    lv_color_t bright = lv_palette_lighten(LV_PALETTE_CYAN, 2);
-    lv_obj_set_style_border_color((lv_obj_t *)var, lv_color_mix(bright, COLOR_CARD_BORDER, (uint8_t)value), 0);
-}
-
-// One-shot "this card just got fresh data" flash — bright border
-// fading back to normal, not a repeating animation.
-static void flash_border(lv_obj_t *obj) {
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, obj);
-    lv_anim_set_exec_cb(&a, border_flash_anim_cb);
-    lv_anim_set_values(&a, 255, 0);
-    lv_anim_set_time(&a, 600);
-    lv_anim_set_repeat_count(&a, 1);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-    lv_anim_start(&a);
-}
+// start_pulse(), start_accent_glow(), and flash_border() now live in
+// ui_common.h/.cpp.
 
 // Vertical ticker scroll: moves `obj` (the combined status+reason
 // container) from fully below the viewport up to fully above it, then
@@ -302,8 +391,102 @@ static void start_vertical_ticker(lv_obj_t *obj, lv_coord_t start_y, lv_coord_t 
     lv_anim_start(&a);
 }
 
+// ============================================================
+// Layer 6 (touch/settings): touch event handlers. All of LVGL's
+// input handling funnels through lv_event_cb_t callbacks like these,
+// registered with lv_obj_add_event_cb() in ui_create() below.
+// ============================================================
+
+static void on_gear_clicked(lv_event_t *e) {
+    LV_UNUSED(e);
+    Serial.println("[touch] gear tapped -> settings screen");
+    lv_screen_load(settings_screen);
+}
+
+static void on_settings_back_clicked(lv_event_t *e) {
+    LV_UNUSED(e);
+    Serial.println("[touch] settings back tapped -> main screen");
+    lv_screen_load(main_screen);
+}
+
+// The tapped backend id (0/1/2) is passed as this callback's
+// user_data when the button is created — see the settings screen
+// build-out below.
+static void on_backend_option_clicked(lv_event_t *e) {
+    uint8_t backend_id = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+    Serial.printf("[touch] backend option %d tapped\n", backend_id);
+    app_request_cloud_backend(backend_id);
+    // Deliberately not updating settings_option_dot[] here — that's
+    // driven by pkt.active_cloud_backend in ui_update(), so the
+    // highlighted option always reflects what main-node has actually
+    // confirmed, not just what was last tapped. If main-node is slow
+    // to switch, the tapped option's dot simply won't light up yet —
+    // an honest "pending" state rather than a fake instant one.
+}
+
+static void on_cloud_badge_clicked(lv_event_t *e) {
+    LV_UNUSED(e);
+    Serial.println("[touch] cloud badge tapped -> force sync");
+    app_request_force_sync();
+}
+
+// Pausing is implemented as delete-the-running-animation (which
+// freezes the object at its current position, a standard LVGL
+// pattern) rather than a dedicated pause API. Resuming starts a fresh
+// animation from wherever it currently sits — always a fixed 7s
+// regardless of remaining distance, a deliberate simplification over
+// computing a proportional duration, since the visual difference
+// (slightly faster or slower resume) is minor and not worth the
+// extra complexity here.
+static void on_banner_clicked(lv_event_t *e) {
+    LV_UNUSED(e);
+    ticker_paused = !ticker_paused;
+    Serial.printf("[touch] banner tapped -> ticker %s\n", ticker_paused ? "paused" : "resumed");
+
+    if (ticker_paused) {
+        lv_anim_del(ticker_content, vertical_scroll_anim_cb);
+    } else {
+        start_vertical_ticker(ticker_content, lv_obj_get_y(ticker_content), -TICKER_CONTENT_H, 7000);
+    }
+}
+
+static void on_dht_card_clicked(lv_event_t *e) {
+    LV_UNUSED(e);
+    Serial.println("[touch] DHT card tapped -> detail screen");
+    detail_which = 0;
+    lv_label_set_text(detail_title_label, "DHT22 Detail");
+    lv_obj_clear_flag(detail_dht_temp_arc, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(detail_dht_temp_caption, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(detail_dht_humidity_arc, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(detail_dht_humidity_caption, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(detail_arc, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(detail_chart, LV_OBJ_FLAG_HIDDEN);
+    lv_screen_load(detail_screen);
+}
+
+static void on_ds_card_clicked(lv_event_t *e) {
+    LV_UNUSED(e);
+    Serial.println("[touch] DS18B20 card tapped -> detail screen");
+    detail_which = 1;
+    lv_label_set_text(detail_title_label, "DS18B20 Detail");
+    lv_obj_add_flag(detail_dht_temp_arc, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(detail_dht_temp_caption, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(detail_dht_humidity_arc, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(detail_dht_humidity_caption, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(detail_arc, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(detail_chart, LV_OBJ_FLAG_HIDDEN);
+    lv_screen_load(detail_screen);
+}
+
+static void on_detail_back_clicked(lv_event_t *e) {
+    LV_UNUSED(e);
+    Serial.println("[touch] detail back tapped -> main screen");
+    lv_screen_load(main_screen);
+}
+
 void ui_create(void) {
     lv_obj_t *screen = lv_screen_active();
+    main_screen = screen; // Layer 6: named so on_*_back_clicked() handlers can navigate back to it
     bare(screen);
     lv_obj_set_style_bg_color(screen, COLOR_BG, 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
@@ -323,27 +506,25 @@ void ui_create(void) {
     lv_obj_set_style_text_letter_space(title_label, 1, 0);
     lv_obj_align(title_label, LV_ALIGN_LEFT_MID, 8, 0);
 
-    // --- Comms status: pill-shaped badge (dark fill, thin border,
-    //     rounded ends), matching "CONNECTED"-style status badges. ---
-    lv_obj_t *comms_badge = lv_obj_create(title_bar);
-    bare(comms_badge);
-    lv_obj_set_size(comms_badge, 84, 18);
-    lv_obj_align(comms_badge, LV_ALIGN_RIGHT_MID, -6, 0);
-    lv_obj_set_style_bg_color(comms_badge, lv_color_hex(0x161b22), 0);
-    lv_obj_set_style_bg_opa(comms_badge, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(comms_badge, 9, 0);
-    lv_obj_set_style_border_width(comms_badge, 1, 0);
-    lv_obj_set_style_border_color(comms_badge, COLOR_CARD_BORDER, 0);
+    // --- Settings gear: opens the cloud-backend settings screen.
+    //     Wrapped in its own 28px-wide clickable container rather than
+    //     making just the glyph tappable — a bare label's hit-box is
+    //     only as big as the rendered characters, too small and fiddly
+    //     to reliably tap on a real touchscreen. ---
+    lv_obj_t *gear_btn = lv_obj_create(title_bar);
+    bare(gear_btn);
+    lv_obj_set_size(gear_btn, 28, TITLE_BAR_H);
+    lv_obj_align(gear_btn, LV_ALIGN_RIGHT_MID, -6, 0); // comms badge moved out of the title bar (now in the right side panel), so this no longer needs to share space with it
+    lv_obj_set_style_bg_opa(gear_btn, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(gear_btn, LV_OBJ_FLAG_CLICKABLE);
+    add_press_feedback(gear_btn, lv_color_hex(0x232a35));
+    lv_obj_add_event_cb(gear_btn, on_gear_clicked, LV_EVENT_CLICKED, NULL);
 
-    comms_dot = make_status_dot(comms_badge);
-    lv_obj_align(comms_dot, LV_ALIGN_LEFT_MID, 6, 0);
-    start_pulse(comms_dot, 900);
-
-    comms_label = lv_label_create(comms_badge);
-    lv_label_set_text(comms_label, "");
-    lv_obj_set_style_text_font(comms_label, FONT_LABEL, 0);
-    lv_obj_set_style_text_color(comms_label, COLOR_TEXT_MUTED, 0);
-    lv_obj_align_to(comms_label, comms_dot, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
+    lv_obj_t *gear_label = lv_label_create(gear_btn);
+    lv_label_set_text(gear_label, LV_SYMBOL_SETTINGS);
+    lv_obj_set_style_text_font(gear_label, FONT_LABEL, 0);
+    lv_obj_set_style_text_color(gear_label, COLOR_TEXT_MUTED, 0);
+    lv_obj_center(gear_label);
 
     lv_obj_t *accent_line = lv_obj_create(screen);
     bare(accent_line);
@@ -352,27 +533,40 @@ void ui_create(void) {
     lv_obj_set_style_bg_opa(accent_line, LV_OPA_COVER, 0);
     start_accent_glow(accent_line);
 
-    // --- System-status strip: WiFi / SD / Cloud, Layer 6's main
-    //     addition — surfaces state that previously only existed in
-    //     main-node's own Serial log. ---
-    wifi_dot = make_mini_badge(screen, CARD_GAP, STATUS_STRIP_Y,
-                                STATUS_BADGE_W, STATUS_STRIP_H, "WiFi");
-    start_pulse(wifi_dot, 900);
+    // --- Left side panel: WiFi, SD, Cloud, and comms transport — all
+    //     four together in one column now, per request. A flex column
+    //     container handles the vertical stacking and spacing itself;
+    //     nothing here is manually positioned, which is deliberate
+    //     after a hand-calculated version of this rendered a badge far
+    //     bigger and in the wrong place than intended. Each badge
+    //     already pulses internally (see make_status_icon_badge()), so
+    //     no separate start_pulse() call is needed here. ---
+    lv_coord_t panel_h = 240 - TITLE_BAR_H - ACCENT_LINE_H;
+    lv_obj_t *left_panel = make_side_panel(screen, 0, panel_h);
 
-    sd_dot = make_mini_badge(screen, CARD_GAP + STATUS_BADGE_W + STATUS_BADGE_GAP, STATUS_STRIP_Y,
-                               STATUS_BADGE_W, STATUS_STRIP_H, "SD");
-    start_pulse(sd_dot, 900);
+    wifi_dot = make_status_icon_badge(left_panel, LV_SYMBOL_WIFI);
+    sd_dot = make_status_icon_badge(left_panel, LV_SYMBOL_SD_CARD);
 
-    cloud_dot = make_mini_badge(screen, CARD_GAP + 2 * (STATUS_BADGE_W + STATUS_BADGE_GAP), STATUS_STRIP_Y,
-                                  STATUS_BADGE_W, STATUS_STRIP_H, "Cloud");
-    start_pulse(cloud_dot, 900);
+    lv_obj_t *cloud_badge_container = nullptr;
+    cloud_dot = make_status_icon_badge(left_panel, LV_SYMBOL_UPLOAD, &cloud_badge_container);
+    lv_obj_add_flag(cloud_badge_container, LV_OBJ_FLAG_CLICKABLE);
+    add_press_feedback(cloud_badge_container, lv_color_hex(0x232a35));
+    lv_obj_add_event_cb(cloud_badge_container, on_cloud_badge_clicked, LV_EVENT_CLICKED, NULL);
+
+    // No dedicated symbol fits "whichever transport happens to be
+    // active" (I2C/ESP-NOW/Bluetooth) — LV_SYMBOL_REFRESH stands in
+    // generically for "data exchange" regardless of which one is
+    // compiled in. comms_label is no longer a visible text label
+    // (icon-only badges now), but ui_set_comms_status() still accepts
+    // the transport name in case a future layer wants it back.
+    comms_dot = make_status_icon_badge(left_panel, LV_SYMBOL_REFRESH);
 
     // --- Sensor cards ---
     lv_obj_t *dht_card = lv_obj_create(screen);
     dht_card_ref = dht_card;
     bare(dht_card);
     lv_obj_set_size(dht_card, CARD_W, CARD_H);
-    lv_obj_set_pos(dht_card, CARD_GAP, CARD_Y);
+    lv_obj_set_pos(dht_card, CENTER_X, CARD_Y);
     lv_obj_set_style_bg_color(dht_card, COLOR_CARD_BG, 0);
     lv_obj_set_style_bg_opa(dht_card, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_grad_color(dht_card, lv_color_hex(0x0d1117), 0);
@@ -381,7 +575,10 @@ void ui_create(void) {
     lv_obj_set_style_border_width(dht_card, 1, 0);
     lv_obj_set_style_radius(dht_card, 2, 0);
     lv_obj_set_style_pad_all(dht_card, 10, 0);
-    add_corner_brackets(screen, CARD_GAP, CARD_Y, CARD_W, CARD_H, lv_palette_main(LV_PALETTE_CYAN));
+    add_corner_brackets(screen, CENTER_X, CARD_Y, CARD_W, CARD_H, lv_palette_main(LV_PALETTE_CYAN));
+    lv_obj_add_flag(dht_card, LV_OBJ_FLAG_CLICKABLE);
+    add_press_feedback(dht_card, lv_color_hex(0x1c2430));
+    lv_obj_add_event_cb(dht_card, on_dht_card_clicked, LV_EVENT_CLICKED, NULL);
 
     dht_dot = make_status_dot(dht_card);
     lv_obj_align(dht_dot, LV_ALIGN_TOP_RIGHT, 0, 2);
@@ -400,10 +597,32 @@ void ui_create(void) {
     lv_obj_set_style_text_color(dht_value_label, COLOR_TEXT_PRIMARY, 0);
     lv_obj_align(dht_value_label, LV_ALIGN_TOP_LEFT, 0, 20);
 
-    create_sparkline(dht_card, 0, 52, dht_spark_bars);
+    // Animated thermometer (temperature) on the left, animated
+    // humidity gauge on the right — both real widgets built/updated
+    // live, replacing the earlier static sparkline bars.
+    dht_thermo = make_thermometer(dht_card, 2, 40, 14, 44, 18);
+
+    dht_humidity_arc = lv_arc_create(dht_card);
+    lv_obj_set_size(dht_humidity_arc, 40, 40);
+    lv_obj_set_pos(dht_humidity_arc, 44, 42);
+    lv_arc_set_rotation(dht_humidity_arc, 270);
+    lv_arc_set_bg_angles(dht_humidity_arc, 0, 360);
+    lv_arc_set_range(dht_humidity_arc, 0, 100);
+    lv_obj_remove_style(dht_humidity_arc, NULL, LV_PART_KNOB | LV_STATE_ANY);
+    lv_obj_clear_flag(dht_humidity_arc, LV_OBJ_FLAG_CLICKABLE); // display-only
+    lv_obj_set_style_arc_color(dht_humidity_arc, lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(dht_humidity_arc, 5, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(dht_humidity_arc, lv_palette_main(LV_PALETTE_BLUE), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(dht_humidity_arc, 5, LV_PART_INDICATOR);
+
+    dht_humidity_value_label = lv_label_create(dht_humidity_arc);
+    lv_label_set_text(dht_humidity_value_label, "--%");
+    lv_obj_set_style_text_font(dht_humidity_value_label, FONT_SIDE_LABEL, 0);
+    lv_obj_set_style_text_color(dht_humidity_value_label, COLOR_TEXT_PRIMARY, 0);
+    lv_obj_center(dht_humidity_value_label);
 
     dht_sub_label = lv_label_create(dht_card);
-    lv_label_set_text(dht_sub_label, "humidity --%");
+    lv_label_set_text(dht_sub_label, "");
     lv_obj_set_style_text_font(dht_sub_label, FONT_LABEL, 0);
     lv_obj_set_style_text_color(dht_sub_label, COLOR_TEXT_MUTED, 0);
     lv_obj_align(dht_sub_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
@@ -412,7 +631,7 @@ void ui_create(void) {
     ds_card_ref = ds_card;
     bare(ds_card);
     lv_obj_set_size(ds_card, CARD_W, CARD_H);
-    lv_obj_set_pos(ds_card, CARD_GAP + CARD_W + CARD_GAP, CARD_Y);
+    lv_obj_set_pos(ds_card, CENTER_X + CARD_W + CARD_GAP, CARD_Y);
     lv_obj_set_style_bg_color(ds_card, COLOR_CARD_BG, 0);
     lv_obj_set_style_bg_opa(ds_card, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_grad_color(ds_card, lv_color_hex(0x0d1117), 0);
@@ -421,7 +640,10 @@ void ui_create(void) {
     lv_obj_set_style_border_width(ds_card, 1, 0);
     lv_obj_set_style_radius(ds_card, 2, 0);
     lv_obj_set_style_pad_all(ds_card, 10, 0);
-    add_corner_brackets(screen, CARD_GAP + CARD_W + CARD_GAP, CARD_Y, CARD_W, CARD_H, lv_palette_main(LV_PALETTE_CYAN));
+    add_corner_brackets(screen, CENTER_X + CARD_W + CARD_GAP, CARD_Y, CARD_W, CARD_H, lv_palette_main(LV_PALETTE_CYAN));
+    lv_obj_add_flag(ds_card, LV_OBJ_FLAG_CLICKABLE);
+    add_press_feedback(ds_card, lv_color_hex(0x1c2430));
+    lv_obj_add_event_cb(ds_card, on_ds_card_clicked, LV_EVENT_CLICKED, NULL);
 
     ds_dot = make_status_dot(ds_card);
     lv_obj_align(ds_dot, LV_ALIGN_TOP_RIGHT, 0, 2);
@@ -440,7 +662,9 @@ void ui_create(void) {
     lv_obj_set_style_text_color(ds_value_label, COLOR_TEXT_PRIMARY, 0);
     lv_obj_align(ds_value_label, LV_ALIGN_TOP_LEFT, 0, 20);
 
-    create_sparkline(ds_card, 0, 52, ds_spark_bars);
+    // Single-value sensor, no humidity to share the row with — bigger
+    // thermometer, centered, than the DHT card's version.
+    ds_thermo = make_thermometer(ds_card, (CARD_W - 20 - 16) / 2, 40, 16, 46, 20);
 
     ds_sub_label = lv_label_create(ds_card);
     lv_label_set_text(ds_sub_label, "");
@@ -451,8 +675,8 @@ void ui_create(void) {
     // --- Status banner ---
     status_banner = lv_obj_create(screen);
     bare(status_banner);
-    lv_obj_set_size(status_banner, 304, BANNER_H);
-    lv_obj_set_pos(status_banner, CARD_GAP, BANNER_Y);
+    lv_obj_set_size(status_banner, CENTER_W, BANNER_H);
+    lv_obj_set_pos(status_banner, CENTER_X, BANNER_Y);
     lv_obj_set_style_bg_color(status_banner, COLOR_BANNER_BG, 0);
     lv_obj_set_style_bg_opa(status_banner, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_grad_color(status_banner, lv_color_hex(0x0d1117), 0);
@@ -467,21 +691,48 @@ void ui_create(void) {
     lv_obj_set_style_shadow_spread(status_banner, 1, 0);
     lv_obj_set_style_shadow_color(status_banner, lv_palette_main(LV_PALETTE_CYAN), 0);
     lv_obj_set_style_shadow_opa(status_banner, LV_OPA_20, 0);
-    add_corner_brackets(screen, CARD_GAP, BANNER_Y, 304, BANNER_H, lv_palette_main(LV_PALETTE_CYAN));
+    add_corner_brackets(screen, CENTER_X, BANNER_Y, CENTER_W, BANNER_H, lv_palette_main(LV_PALETTE_CYAN));
+    lv_obj_add_flag(status_banner, LV_OBJ_FLAG_CLICKABLE);
+    add_press_feedback(status_banner, lv_color_hex(0x1c2430));
+    lv_obj_add_event_cb(status_banner, on_banner_clicked, LV_EVENT_CLICKED, NULL);
 
-    // --- Vertical ticker: status line + reason line, scrolling
-    //     upward together inside a clipped viewport. Replaces the old
-    //     horizontal marquee — a fixed-height banner otherwise can't
-    //     show both a status line and a wrapped reason line at once
-    //     without clipping one of them.
-    lv_coord_t ticker_viewport_w = 304 - 12; // banner width minus its own pad_all*2
-    lv_coord_t ticker_viewport_h = BANNER_H - 12;
-    lv_coord_t ticker_content_h = 60; // status line + up to 2 wrapped reason lines
+    // --- Static "STATUS" title — fixed at the top-center of the
+    //     banner, deliberately NOT part of the scrolling ticker below
+    //     it. Its own distinct pill background + wide letter-spacing
+    //     gives it a badge/header look, separate from the live status
+    //     value that scrolls underneath. ---
+    lv_obj_t *status_title_box = lv_obj_create(status_banner);
+    bare(status_title_box);
+    lv_obj_set_size(status_title_box, 76, 18);
+    lv_obj_align(status_title_box, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(status_title_box, lv_palette_darken(LV_PALETTE_CYAN, 3), 0);
+    lv_obj_set_style_bg_opa(status_title_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(status_title_box, 9, 0);
+    lv_obj_set_style_border_width(status_title_box, 1, 0);
+    lv_obj_set_style_border_color(status_title_box, lv_palette_main(LV_PALETTE_CYAN), 0);
+
+    lv_obj_t *status_title_label = lv_label_create(status_title_box);
+    lv_label_set_text(status_title_label, "STATUS");
+    lv_obj_set_style_text_font(status_title_label, FONT_SIDE_LABEL, 0);
+    lv_obj_set_style_text_color(status_title_label, lv_palette_lighten(LV_PALETTE_CYAN, 2), 0);
+    lv_obj_set_style_text_letter_space(status_title_label, 2, 0);
+    lv_obj_center(status_title_label);
+
+    // --- Vertical ticker: status value + reason line, scrolling
+    //     upward together inside a clipped viewport, positioned below
+    //     the static STATUS title above. Replaces the old horizontal
+    //     marquee — a fixed-height banner otherwise can't show both a
+    //     status line and a wrapped reason line at once without
+    //     clipping one of them.
+    lv_coord_t ticker_header_h = 22; // static STATUS title box + a small gap, reserved above the scrolling area
+    lv_coord_t ticker_viewport_w = CENTER_W - 12; // banner width minus its own pad_all*2
+    lv_coord_t ticker_viewport_h = (BANNER_H - 12) - ticker_header_h;
+    lv_coord_t ticker_content_h = TICKER_CONTENT_H;
 
     lv_obj_t *ticker_viewport = lv_obj_create(status_banner);
     bare(ticker_viewport);
     lv_obj_set_size(ticker_viewport, ticker_viewport_w, ticker_viewport_h);
-    lv_obj_align(ticker_viewport, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_align(ticker_viewport, LV_ALIGN_TOP_LEFT, 0, ticker_header_h);
     lv_obj_set_style_bg_opa(ticker_viewport, LV_OPA_TRANSP, 0);
     // Default LVGL clipping keeps ticker_content's off-screen portions
     // (above/below this viewport) hidden as it scrolls through.
@@ -492,10 +743,12 @@ void ui_create(void) {
     lv_obj_set_pos(ticker_content, 0, ticker_viewport_h); // starts just below the viewport
     lv_obj_set_style_bg_opa(ticker_content, LV_OPA_TRANSP, 0);
 
-    // Status line: the "special font" treatment — bumped up to
+    // Status value line: the "special font" treatment — bumped up to
     // FONT_TITLE (this project's largest available size) rather than
-    // the sensor cards' FONT_VALUE, so the status line reads as the
-    // banner's clear focal point rather than matching card body text.
+    // the sensor cards' FONT_VALUE, so it reads as the banner's clear
+    // focal point. Shows just the value now (e.g. "OK") rather than
+    // "Status: OK" — the word "Status" itself is the static title box
+    // above, not repeated here.
     status_label = lv_label_create(ticker_content);
     lv_label_set_text(status_label, "Waiting for main-node...");
     lv_obj_set_style_text_font(status_label, FONT_TITLE, 0);
@@ -532,6 +785,187 @@ void ui_create(void) {
         ds_temp_history[i] = 20.0f;
     }
     history_initialized = true;
+
+    // ============================================================
+    // ============================================================
+    // Layer 6 (touch/settings): Settings screen — cloud backend
+    // toggle. A separate lv_screen (not a modal), reached via the
+    // title bar's gear icon.
+    // ============================================================
+    settings_screen = lv_obj_create(NULL);
+    bare(settings_screen);
+    lv_obj_set_style_bg_color(settings_screen, COLOR_BG, 0);
+    lv_obj_set_style_bg_opa(settings_screen, LV_OPA_COVER, 0);
+
+    make_nav_header(settings_screen, "CLOUD BACKEND", on_settings_back_clicked);
+
+    // Active-backend confirmation banner — same visual language as
+    // the main dashboard's cards (dark fill, cyan accent) instead of
+    // a plain label buried at the screen's edge.
+    lv_obj_t *active_banner = lv_obj_create(settings_screen);
+    bare(active_banner);
+    lv_obj_set_size(active_banner, 304, 32);
+    lv_obj_set_pos(active_banner, CARD_GAP, 40);
+    lv_obj_set_style_bg_color(active_banner, lv_color_hex(0x161b22), 0);
+    lv_obj_set_style_bg_opa(active_banner, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(active_banner, 4, 0);
+    lv_obj_set_style_border_side(active_banner, LV_BORDER_SIDE_LEFT, 0);
+    lv_obj_set_style_border_width(active_banner, 3, 0);
+    lv_obj_set_style_border_color(active_banner, lv_palette_main(LV_PALETTE_CYAN), 0);
+
+    settings_active_label = lv_label_create(active_banner);
+    lv_label_set_text(settings_active_label, "Active: —");
+    lv_obj_set_style_text_font(settings_active_label, FONT_VALUE, 0);
+    lv_obj_set_style_text_color(settings_active_label, COLOR_TEXT_PRIMARY, 0);
+    lv_obj_align(settings_active_label, LV_ALIGN_LEFT_MID, 12, 0);
+
+    const char *backend_names[3] = {"Google Sheets", "Firebase", "AWS"};
+    lv_coord_t row_h = 36;
+    lv_coord_t row_gap = 6;
+    lv_coord_t row_y = 80;
+
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *row = lv_obj_create(settings_screen);
+        bare(row);
+        lv_obj_set_size(row, 304, row_h);
+        lv_obj_set_pos(row, CARD_GAP, row_y + i * (row_h + row_gap));
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x161b22), 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, COLOR_CARD_BORDER, 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        add_press_feedback(row, lv_color_hex(0x232a35));
+        lv_obj_add_event_cb(row, on_backend_option_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        settings_option_dot[i] = make_status_dot(row);
+        lv_obj_align(settings_option_dot[i], LV_ALIGN_LEFT_MID, 12, 0);
+
+        lv_obj_t *row_label = lv_label_create(row);
+        lv_label_set_text(row_label, backend_names[i]);
+        lv_obj_set_style_text_font(row_label, FONT_VALUE, 0);
+        lv_obj_set_style_text_color(row_label, COLOR_TEXT_PRIMARY, 0);
+        lv_obj_align_to(row_label, settings_option_dot[i], LV_ALIGN_OUT_RIGHT_MID, 12, 0);
+
+        // Checkmark is the clearer "confirmed active" signal — shown
+        // or hidden in ui_update(), not just a recolored dot.
+        settings_option_check[i] = lv_label_create(row);
+        lv_label_set_text(settings_option_check[i], LV_SYMBOL_OK);
+        lv_obj_set_style_text_font(settings_option_check[i], FONT_LABEL, 0);
+        lv_obj_set_style_text_color(settings_option_check[i], lv_palette_main(LV_PALETTE_GREEN), 0);
+        lv_obj_align(settings_option_check[i], LV_ALIGN_RIGHT_MID, -12, 0);
+        lv_obj_add_flag(settings_option_check[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // ============================================================
+    // Layer 6 (touch/settings): Detail screen — larger view of
+    // whichever sensor's card was tapped. Reuses the same retained
+    // history the dashboard's small sparklines already track, now
+    // rendered with LVGL's own arc and chart widgets instead of
+    // hand-rolled bars.
+    // ============================================================
+    detail_screen = lv_obj_create(NULL);
+    bare(detail_screen);
+    lv_obj_set_style_bg_color(detail_screen, COLOR_BG, 0);
+    lv_obj_set_style_bg_opa(detail_screen, LV_OPA_COVER, 0);
+
+    make_nav_header(detail_screen, "SENSOR DETAIL", on_detail_back_clicked, &detail_title_label);
+
+    // Real LVGL arc gauge — read-only (no knob, not draggable), just
+    // used as a radial value display instead of a plain number.
+    detail_arc = lv_arc_create(detail_screen);
+    lv_obj_set_size(detail_arc, 130, 130);
+    lv_obj_align(detail_arc, LV_ALIGN_TOP_MID, 0, 42);
+    lv_arc_set_rotation(detail_arc, 135);
+    lv_arc_set_bg_angles(detail_arc, 0, 270);
+    lv_arc_set_range(detail_arc, 0, 50); // 0-50C covers both sensors' realistic range
+    lv_obj_remove_style(detail_arc, NULL, LV_PART_KNOB | LV_STATE_ANY); // no draggable handle
+    lv_obj_clear_flag(detail_arc, LV_OBJ_FLAG_CLICKABLE); // display-only, not user-adjustable
+    lv_obj_set_style_arc_color(detail_arc, lv_color_hex(0x232a35), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(detail_arc, 12, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(detail_arc, lv_palette_main(LV_PALETTE_CYAN), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(detail_arc, 12, LV_PART_INDICATOR);
+
+    detail_value_label = lv_label_create(detail_arc);
+    lv_label_set_text(detail_value_label, "--.-C");
+    lv_obj_set_style_text_font(detail_value_label, FONT_TITLE, 0);
+    lv_obj_set_style_text_color(detail_value_label, COLOR_TEXT_PRIMARY, 0);
+    lv_obj_center(detail_value_label);
+
+    // Real LVGL chart for history — native gridlines and line-drawing
+    // instead of a manual bar approximation.
+    detail_chart = lv_chart_create(detail_screen);
+    lv_obj_set_size(detail_chart, 304, 55);
+    lv_obj_align(detail_chart, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(detail_chart, lv_color_hex(0x161b22), 0);
+    lv_obj_set_style_bg_opa(detail_chart, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(detail_chart, 1, 0);
+    lv_obj_set_style_border_color(detail_chart, COLOR_CARD_BORDER, 0);
+    lv_obj_set_style_radius(detail_chart, 4, 0);
+    lv_chart_set_type(detail_chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(detail_chart, SPARK_N);
+    lv_chart_set_range(detail_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 50);
+    lv_chart_set_div_line_count(detail_chart, 3, 0);
+    detail_chart_series = lv_chart_add_series(detail_chart, lv_palette_main(LV_PALETTE_CYAN), LV_CHART_AXIS_PRIMARY_Y);
+
+    // --- DHT22 view: temp + humidity arcs side by side. Smaller than
+    //     the DS18B20 view's single arc (110px vs 130px) since two
+    //     need to fit side by side, and no chart here — there's no
+    //     retained humidity history to chart alongside temperature. ---
+    detail_dht_temp_arc = lv_arc_create(detail_screen);
+    lv_obj_set_size(detail_dht_temp_arc, 110, 110);
+    lv_obj_set_pos(detail_dht_temp_arc, 40, 50);
+    lv_arc_set_rotation(detail_dht_temp_arc, 135);
+    lv_arc_set_bg_angles(detail_dht_temp_arc, 0, 270);
+    lv_arc_set_range(detail_dht_temp_arc, 0, 50);
+    lv_obj_remove_style(detail_dht_temp_arc, NULL, LV_PART_KNOB | LV_STATE_ANY);
+    lv_obj_clear_flag(detail_dht_temp_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_color(detail_dht_temp_arc, lv_color_hex(0x232a35), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(detail_dht_temp_arc, 10, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(detail_dht_temp_arc, lv_palette_main(LV_PALETTE_CYAN), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(detail_dht_temp_arc, 10, LV_PART_INDICATOR);
+
+    detail_dht_temp_value_label = lv_label_create(detail_dht_temp_arc);
+    lv_label_set_text(detail_dht_temp_value_label, "--.-C");
+    lv_obj_set_style_text_font(detail_dht_temp_value_label, FONT_VALUE, 0);
+    lv_obj_set_style_text_color(detail_dht_temp_value_label, COLOR_TEXT_PRIMARY, 0);
+    lv_obj_center(detail_dht_temp_value_label);
+
+    detail_dht_temp_caption = lv_label_create(detail_screen);
+    lv_label_set_text(detail_dht_temp_caption, "Temperature");
+    lv_obj_set_style_text_font(detail_dht_temp_caption, FONT_SIDE_LABEL, 0);
+    lv_obj_set_style_text_color(detail_dht_temp_caption, COLOR_TEXT_MUTED, 0);
+    lv_obj_align(detail_dht_temp_caption, LV_ALIGN_TOP_LEFT, 40, 164);
+
+    detail_dht_humidity_arc = lv_arc_create(detail_screen);
+    lv_obj_set_size(detail_dht_humidity_arc, 110, 110);
+    lv_obj_set_pos(detail_dht_humidity_arc, 170, 50);
+    lv_arc_set_rotation(detail_dht_humidity_arc, 135);
+    lv_arc_set_bg_angles(detail_dht_humidity_arc, 0, 270);
+    lv_arc_set_range(detail_dht_humidity_arc, 0, 100);
+    lv_obj_remove_style(detail_dht_humidity_arc, NULL, LV_PART_KNOB | LV_STATE_ANY);
+    lv_obj_clear_flag(detail_dht_humidity_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_color(detail_dht_humidity_arc, lv_color_hex(0x232a35), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(detail_dht_humidity_arc, 10, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(detail_dht_humidity_arc, lv_palette_main(LV_PALETTE_BLUE), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(detail_dht_humidity_arc, 10, LV_PART_INDICATOR);
+
+    detail_dht_humidity_value_label = lv_label_create(detail_dht_humidity_arc);
+    lv_label_set_text(detail_dht_humidity_value_label, "--%");
+    lv_obj_set_style_text_font(detail_dht_humidity_value_label, FONT_VALUE, 0);
+    lv_obj_set_style_text_color(detail_dht_humidity_value_label, COLOR_TEXT_PRIMARY, 0);
+    lv_obj_center(detail_dht_humidity_value_label);
+
+    detail_dht_humidity_caption = lv_label_create(detail_screen);
+    lv_label_set_text(detail_dht_humidity_caption, "Humidity");
+    lv_obj_set_style_text_font(detail_dht_humidity_caption, FONT_SIDE_LABEL, 0);
+    lv_obj_set_style_text_color(detail_dht_humidity_caption, COLOR_TEXT_MUTED, 0);
+    lv_obj_align(detail_dht_humidity_caption, LV_ALIGN_TOP_LEFT, 170, 164);
+
+    // Default state matches detail_which's default (0 = DHT22) — the
+    // DS18B20 view starts hidden until its card is actually tapped.
+    lv_obj_add_flag(detail_arc, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(detail_chart, LV_OBJ_FLAG_HIDDEN);
 }
 
 void ui_update(const CommsPacket &pkt, bool haveEverReceivedPacket, bool linkStale) {
@@ -541,7 +975,15 @@ void ui_update(const CommsPacket &pkt, bool haveEverReceivedPacket, bool linkSta
 
     char buf[64];
 
-    snprintf(buf, sizeof(buf), "%.1fC", pkt.dht_temperature_c);
+    if (pkt.dht_read_ok) {
+        snprintf(buf, sizeof(buf), "%.1fC", pkt.dht_temperature_c);
+    } else {
+        // %.1f of a NaN prints the literal text "nanC" — this is the
+        // same class of bug the Google Sheets JSON had (Layer 3's
+        // formatNumberOrNull fix). Guard it here the same way: only
+        // format the number when the read actually succeeded.
+        snprintf(buf, sizeof(buf), "--.-C");
+    }
     lv_label_set_text(dht_value_label, buf);
     set_dot_color(dht_dot,
         pkt.dht_read_ok ? lv_palette_main(LV_PALETTE_GREEN) : lv_palette_main(LV_PALETTE_RED));
@@ -549,15 +991,34 @@ void ui_update(const CommsPacket &pkt, bool haveEverReceivedPacket, bool linkSta
     if (pkt.dht_read_ok) {
         push_history(dht_temp_history, pkt.dht_temperature_c);
     }
-    update_sparkline(dht_spark_bars, dht_temp_history, 0.0f, 50.0f,
-                      pkt.dht_read_ok ? lv_palette_main(LV_PALETTE_CYAN) : lv_palette_main(LV_PALETTE_RED));
+    set_thermometer_value(dht_thermo, pkt.dht_temperature_c, pkt.dht_read_ok, 0.0f, 50.0f, 44);
 
-    snprintf(buf, sizeof(buf), pkt.dht_read_ok ? "humidity %.0f%%" : "READ FAILING", pkt.dht_humidity_pct);
-    lv_label_set_text(dht_sub_label, buf);
+    if (pkt.dht_read_ok) {
+        snprintf(buf, sizeof(buf), "%.0f%%", pkt.dht_humidity_pct);
+    } else {
+        // Same NaN-formatting guard as the temperature values —
+        // dht_humidity_pct is also NaN whenever dht_read_ok is false.
+        snprintf(buf, sizeof(buf), "--%%");
+    }
+    lv_label_set_text(dht_humidity_value_label, buf);
+    int32_t humidityTarget = pkt.dht_read_ok ? (int32_t)pkt.dht_humidity_pct : 0;
+    animate_arc_to(dht_humidity_arc, dht_humidity_last_val, humidityTarget, 400);
+    dht_humidity_last_val = humidityTarget;
+    lv_obj_set_style_arc_color(dht_humidity_arc,
+        pkt.dht_read_ok ? lv_palette_main(LV_PALETTE_BLUE) : lv_palette_main(LV_PALETTE_RED), LV_PART_INDICATOR);
+
+    // Now just a failure indicator, matching ds_sub_label's pattern —
+    // the humidity value itself lives in the arc gauge above, so
+    // showing it again here would just duplicate it.
+    lv_label_set_text(dht_sub_label, pkt.dht_read_ok ? "" : "READ FAILING");
     lv_obj_set_style_text_color(dht_sub_label,
         pkt.dht_read_ok ? COLOR_TEXT_MUTED : lv_palette_main(LV_PALETTE_RED), 0);
 
-    snprintf(buf, sizeof(buf), "%.2fC", pkt.ds18b20_temperature_c);
+    if (pkt.ds18b20_read_ok) {
+        snprintf(buf, sizeof(buf), "%.2fC", pkt.ds18b20_temperature_c);
+    } else {
+        snprintf(buf, sizeof(buf), "--.-C");
+    }
     lv_label_set_text(ds_value_label, buf);
     set_dot_color(ds_dot,
         pkt.ds18b20_read_ok ? lv_palette_main(LV_PALETTE_GREEN) : lv_palette_main(LV_PALETTE_RED));
@@ -565,8 +1026,7 @@ void ui_update(const CommsPacket &pkt, bool haveEverReceivedPacket, bool linkSta
     if (pkt.ds18b20_read_ok) {
         push_history(ds_temp_history, pkt.ds18b20_temperature_c);
     }
-    update_sparkline(ds_spark_bars, ds_temp_history, 0.0f, 50.0f,
-                      pkt.ds18b20_read_ok ? lv_palette_main(LV_PALETTE_CYAN) : lv_palette_main(LV_PALETTE_RED));
+    set_thermometer_value(ds_thermo, pkt.ds18b20_temperature_c, pkt.ds18b20_read_ok, 0.0f, 50.0f, 46);
 
     lv_label_set_text(ds_sub_label, pkt.ds18b20_read_ok ? "" : "READ FAILING");
     lv_obj_set_style_text_color(ds_sub_label,
@@ -577,21 +1037,102 @@ void ui_update(const CommsPacket &pkt, bool haveEverReceivedPacket, bool linkSta
     // showing dimmed rather than a flat grey "unknown", since a stale
     // WiFi=green from 30 seconds ago is still more informative than
     // nothing while you're figuring out why the link dropped.
-    set_dot_color(wifi_dot,
+    set_icon_status_color(wifi_dot,
         pkt.wifi_connected ? lv_palette_main(LV_PALETTE_GREEN) : lv_palette_main(LV_PALETTE_RED));
-    set_dot_color(sd_dot,
+    set_icon_status_color(sd_dot,
         pkt.sd_card_ok ? lv_palette_main(LV_PALETTE_GREEN) : lv_palette_main(LV_PALETTE_RED));
-    set_dot_color(cloud_dot,
+    set_icon_status_color(cloud_dot,
         pkt.cloud_sync_ok ? lv_palette_main(LV_PALETTE_GREEN) : lv_palette_main(LV_PALETTE_RED));
 
     uint8_t effectiveStatus = linkStale ? 3 : pkt.health_status;
     lv_obj_set_style_bg_color(status_banner, statusToBgColor(effectiveStatus), 0);
 
-    snprintf(buf, sizeof(buf), "Status: %s", linkStale ? "LINK LOST" : statusToStr(pkt.health_status));
+    snprintf(buf, sizeof(buf), "%s", linkStale ? "LINK LOST" : statusToStr(pkt.health_status));
     lv_label_set_text(status_label, buf);
     lv_obj_set_style_text_color(status_label, statusToColor(effectiveStatus), 0);
 
     lv_label_set_text(reason_label, linkStale ? "No packet received in over 10 seconds" : pkt.health_reason);
+
+    // Layer 6 (touch/settings): keep the Settings and Detail screens
+    // fresh even while the main dashboard is the one actually visible —
+    // switching screens should never show stale data from whenever
+    // that screen was last on top.
+    snprintf(buf, sizeof(buf), "Active: %s", cloudBackendName(pkt.active_cloud_backend));
+    lv_label_set_text(settings_active_label, buf);
+    for (int i = 0; i < 3; i++) {
+        bool isActive = (pkt.active_cloud_backend == i);
+        set_dot_color(settings_option_dot[i],
+            isActive ? lv_palette_main(LV_PALETTE_GREEN) : lv_palette_main(LV_PALETTE_GREY));
+        if (isActive) {
+            lv_obj_clear_flag(settings_option_check[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(settings_option_check[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    // Both view sets update every cycle regardless of which one is
+    // currently visible (visibility is toggled only on card tap, in
+    // on_dht_card_clicked()/on_ds_card_clicked()) — so whichever one
+    // you switch to next is already showing fresh data, not whatever
+    // was last on screen.
+
+    // --- DS18B20 view: single arc + chart ---
+    if (pkt.ds18b20_read_ok) {
+        snprintf(buf, sizeof(buf), "%.2fC", pkt.ds18b20_temperature_c);
+    } else {
+        // Same NaN-formatting guard as the main dashboard's cards —
+        // a failed read's value is NaN, and %.2f of NaN prints the
+        // literal text "nanC", not a clean placeholder.
+        snprintf(buf, sizeof(buf), "--.-C");
+    }
+    lv_label_set_text(detail_value_label, buf);
+
+    lv_color_t dsColor = pkt.ds18b20_read_ok ? lv_palette_main(LV_PALETTE_CYAN) : lv_palette_main(LV_PALETTE_RED);
+    lv_obj_set_style_arc_color(detail_arc, dsColor, LV_PART_INDICATOR);
+    // Casting a NaN float to int32_t is undefined/implementation-defined
+    // behavior in C++ — hold the arc at its last good position instead
+    // of feeding it a NaN-derived value when the read has failed.
+    if (pkt.ds18b20_read_ok) {
+        lv_arc_set_value(detail_arc, (int32_t)pkt.ds18b20_temperature_c);
+    }
+
+    for (int i = 0; i < SPARK_N; i++) {
+        lv_chart_set_value_by_id(detail_chart, detail_chart_series, i, (int32_t)ds_temp_history[i]);
+    }
+    // Series color lives on the series struct itself in LVGL — more
+    // reliable than guessing at a style-part selector for something
+    // I can't render and check.
+    detail_chart_series->color = dsColor;
+    lv_chart_refresh(detail_chart);
+
+    // --- DHT22 view: temp + humidity arcs side by side ---
+    if (pkt.dht_read_ok) {
+        snprintf(buf, sizeof(buf), "%.1fC", pkt.dht_temperature_c);
+    } else {
+        snprintf(buf, sizeof(buf), "--.-C");
+    }
+    lv_label_set_text(detail_dht_temp_value_label, buf);
+
+    lv_color_t dhtTempColor = pkt.dht_read_ok ? lv_palette_main(LV_PALETTE_CYAN) : lv_palette_main(LV_PALETTE_RED);
+    lv_obj_set_style_arc_color(detail_dht_temp_arc, dhtTempColor, LV_PART_INDICATOR);
+    if (pkt.dht_read_ok) {
+        lv_arc_set_value(detail_dht_temp_arc, (int32_t)pkt.dht_temperature_c);
+    }
+
+    if (pkt.dht_read_ok) {
+        snprintf(buf, sizeof(buf), "%.0f%%", pkt.dht_humidity_pct);
+    } else {
+        // dht_humidity_pct is also NaN whenever dht_read_ok is false —
+        // same guard, same reason.
+        snprintf(buf, sizeof(buf), "--%%");
+    }
+    lv_label_set_text(detail_dht_humidity_value_label, buf);
+
+    lv_color_t dhtHumidityColor = pkt.dht_read_ok ? lv_palette_main(LV_PALETTE_BLUE) : lv_palette_main(LV_PALETTE_RED);
+    lv_obj_set_style_arc_color(detail_dht_humidity_arc, dhtHumidityColor, LV_PART_INDICATOR);
+    if (pkt.dht_read_ok) {
+        lv_arc_set_value(detail_dht_humidity_arc, (int32_t)pkt.dht_humidity_pct);
+    }
 
     // Live-update heartbeat — a brief border flash on each refresh
     // cycle, so the dashboard visibly "breathes" with new data rather
@@ -601,7 +1142,12 @@ void ui_update(const CommsPacket &pkt, bool haveEverReceivedPacket, bool linkSta
 }
 
 void ui_set_comms_status(const char *transportName, bool active) {
-    lv_label_set_text(comms_label, transportName);
-    set_dot_color(comms_dot,
+    // transportName is intentionally unused now — the side panel is
+    // icon-only (see make_status_icon_badge() in status_icons.cpp),
+    // no visible text label to update. Parameter kept in ui.h's public
+    // signature so main.cpp doesn't need to change, and in case a
+    // future layer wants the text back.
+    (void)transportName;
+    set_icon_status_color(comms_dot,
         active ? lv_palette_main(LV_PALETTE_GREEN) : lv_palette_main(LV_PALETTE_RED));
 }

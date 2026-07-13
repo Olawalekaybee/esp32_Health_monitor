@@ -1,7 +1,4 @@
 #include "cloud/cloud_google_sheets.h"
-#include "cloud/cloud_backend_select.h"
-
-#if CLOUD_BACKEND_GOOGLE_SHEETS
 
 #include "config.h"
 #include <Arduino.h>
@@ -81,13 +78,13 @@ static void buildJsonPayload(char *out,
         health.reason);
 }
 
-bool cloud_sync_init()
+bool cloud_sync_init_google_sheets()
 {
     Serial.println("[cloud_google_sheets] Initialized");
     return true;
 }
 
-bool cloud_sync_send(const SensorSample &sample,
+bool cloud_sync_send_google_sheets(const SensorSample &sample,
                      const HealthReport &health)
 {
     char json[512];
@@ -136,5 +133,3 @@ bool cloud_sync_send(const SensorSample &sample,
     // themselves rejected the request.
     return (httpCode > 0) && (httpCode < 400);
 }
-
-#endif

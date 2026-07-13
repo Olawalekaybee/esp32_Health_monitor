@@ -1,25 +1,19 @@
 #pragma once
 // ============================================================
-// cloud_backend_select.h — single source of truth for which cloud
-// backend is active. Included by network_task.cpp (to pick which
-// header to include) AND by each backend's own .cpp file (to guard
-// its implementation).
+// cloud_backend_select.h — retired as of Layer 6.
 //
-// This second part matters: PlatformIO compiles EVERY .cpp file
-// under src/ regardless of which header gets #included elsewhere —
-// unlike a simple #if around an #include, that alone doesn't stop
-// unselected backends from being compiled too. Since all backends
-// deliberately share the same function names (cloud_sync_init,
-// cloud_sync_send) for interchangeability, compiling more than one
-// unguarded causes "multiple definition" linker errors. Each backend
-// .cpp wraps its actual body in #if CLOUD_BACKEND_XXX using the
-// macros below, so only the selected one contributes any symbols —
-// the other two compile to empty, harmless translation units.
+// This used to be the single source of truth for which cloud backend
+// was compiled in, guarding each backend's .cpp body so only one set
+// of cloud_sync_init()/cloud_sync_send() symbols existed at link time.
+//
+// Layer 6 replaced that with cloud_dispatch.h: each backend now has a
+// uniquely-named pair of functions (cloud_sync_init_google_sheets(),
+// etc.), so all three compile in simultaneously with no name
+// collision, and cloud_dispatch.cpp picks which one actually runs —
+// at runtime, from the CYD's settings screen, not just at compile
+// time. See cloud_dispatch.h for the CloudBackendId enum and the
+// default backend constant.
+//
+// Nothing includes this file anymore. Kept only so it doesn't vanish
+// out from under anyone with it open — safe to delete.
 // ============================================================
-#define CLOUD_BACKEND_GOOGLE_SHEETS 1
-#define CLOUD_BACKEND_FIREBASE      0
-#define CLOUD_BACKEND_AWS           0
-
-#if (CLOUD_BACKEND_GOOGLE_SHEETS + CLOUD_BACKEND_FIREBASE + CLOUD_BACKEND_AWS) != 1
-    #error "Choose exactly one cloud backend (CLOUD_BACKEND_GOOGLE_SHEETS / _FIREBASE / _AWS)"
-#endif

@@ -31,11 +31,39 @@
 static volatile bool lastAckLinkOk = false;
 static volatile uint32_t lastAckMillis = 0;
 
+// Edge-detection for force_sync_requested — the CYD holds that byte
+// at 1 for ~2 seconds after a tap (see cyd-display-node's
+// app_request_force_sync()), so a plain "if true, give the semaphore"
+// would give it repeatedly across several consecutive polls. Giving
+// an already-given binary semaphore again is harmless (FreeRTOS just
+// no-ops it), but the edge check makes the intent explicit: one tap,
+// one wake.
+static bool lastForceSyncFlag = false;
+
 static void onAckReceived(const CydAckPacket &ack) {
     lastAckLinkOk = (ack.link_ok != 0);
     lastAckMillis = millis();
-    Serial.printf("[comms_task] Ack received from CYD: uptime=%lums, link_ok=%d\n",
-                  ack.cyd_uptime_ms, ack.link_ok);
+
+    // Layer 6 (touch/settings): relay the CYD's requested backend into
+    // statusQueue for network_task to act on. Deliberately NOT
+    // validating the byte here — network_task does that with
+    // cloud_backend_id_valid() right before it would matter (casting
+    // to CloudBackendId and dispatching), which is the one place an
+    // invalid value could actually cause harm.
+    SystemStatus status = {};
+    xQueuePeek(statusQueue, &status, 0);
+    status.requested_cloud_backend = ack.requested_cloud_backend;
+    xQueueOverwrite(statusQueue, &status);
+
+    bool forceSyncNow = (ack.force_sync_requested != 0);
+    if (forceSyncNow && !lastForceSyncFlag) {
+        xSemaphoreGive(forceSyncSemaphore);
+        Serial.println("[comms_task] Force-sync requested from CYD");
+    }
+    lastForceSyncFlag = forceSyncNow;
+
+    Serial.printf("[comms_task] Ack received from CYD: uptime=%lums, link_ok=%d, requested_backend=%d\n",
+                  ack.cyd_uptime_ms, ack.link_ok, ack.requested_cloud_backend);
 }
 
 // Same read-modify-write pattern network_task/storage_task use — see
@@ -91,6 +119,7 @@ void commsTask(void *pvParameters) {
             packet.wifi_connected        = status.wifi_connected ? 1 : 0;
             packet.sd_card_ok            = status.sd_card_ok ? 1 : 0;
             packet.cloud_sync_ok         = status.cloud_sync_ok ? 1 : 0;
+            packet.active_cloud_backend  = status.active_cloud_backend;
 
 #if USE_ESPNOW
             espnow_comms_send(packet);

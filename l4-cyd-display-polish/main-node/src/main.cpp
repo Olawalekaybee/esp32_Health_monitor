@@ -22,6 +22,16 @@ QueueHandle_t statusQueue;   // length 1, always overwritten -> "latest system s
                              // written by storage_task/network_task/comms_task, read by
                              // comms_task to build the outgoing packet to the CYD)
 
+// Layer 6 (touch/settings): lets comms_task wake network_task
+// immediately when the CYD's Cloud badge is tapped, instead of
+// network_task only noticing on its next scheduled cycle (which could
+// be up to CLOUD_SYNC_INTERVAL_MS away — using a polled status field
+// for this would make "force sync now" not actually immediate). See
+// network_task.cpp: it blocks on this semaphore with a timeout instead
+// of a plain vTaskDelay, so a give() wakes it early while a timeout
+// still falls through to the normal periodic behavior.
+SemaphoreHandle_t forceSyncSemaphore;
+
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -32,9 +42,10 @@ void setup() {
     sensorQueue = xQueueCreate(1, sizeof(SensorSample)); // mailbox: all consumers use xQueuePeek, so this must be length-1 + overwrite, not a FIFO
     healthQueue = xQueueCreate(1, sizeof(HealthReport));
     statusQueue = xQueueCreate(1, sizeof(SystemStatus));
+    forceSyncSemaphore = xSemaphoreCreateBinary();
 
-    if (sensorQueue == NULL || healthQueue == NULL || statusQueue == NULL) {
-        Serial.println("FATAL: queue creation failed");
+    if (sensorQueue == NULL || healthQueue == NULL || statusQueue == NULL || forceSyncSemaphore == NULL) {
+        Serial.println("FATAL: queue/semaphore creation failed");
         while (true) { delay(1000); }
     }
 

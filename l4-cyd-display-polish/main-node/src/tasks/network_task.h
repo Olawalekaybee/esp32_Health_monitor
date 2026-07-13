@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <freertos/semphr.h>
 #include "shared_types.h"
 
 // ============================================================
@@ -20,5 +21,6 @@
 extern QueueHandle_t sensorQueue;
 extern QueueHandle_t healthQueue;
 extern QueueHandle_t statusQueue;
+extern SemaphoreHandle_t forceSyncSemaphore;
 
 void networkTask(void *pvParameters);

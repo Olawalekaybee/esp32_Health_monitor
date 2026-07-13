@@ -56,6 +56,28 @@ static CommsPacket latest;
 static volatile bool havePacket = false;
 static volatile uint32_t lastPacketMillis = 0;
 
+// Layer 6 (touch/settings): state set by ui.cpp's touch handlers, read
+// here when building the outgoing ack. ui.cpp owns rendering and
+// touch; this file owns building the ack packet — these two functions
+// are the deliberate, narrow crossing point between them, declared in
+// ui.h and implemented here rather than in ui.cpp.
+static uint8_t g_requestedCloudBackend = 0; // 0=Google Sheets, matches CloudBackendId on main-node
+static uint32_t g_forceSyncUntilMs = 0;      // ack keeps force_sync_requested=1 until millis() passes this
+
+void app_request_cloud_backend(uint8_t backend_id) {
+    g_requestedCloudBackend = backend_id;
+    Serial.printf("[main] Cloud backend requested: %d\n", backend_id);
+}
+
+void app_request_force_sync() {
+    // Held "on" for 2 seconds rather than one single ack transmission —
+    // main-node polls for the ack roughly once a second (COMMS_SEND_INTERVAL_MS
+    // on that side), so a single-shot flag risks landing between polls
+    // and being missed entirely. 2 seconds gives it a couple of chances.
+    g_forceSyncUntilMs = millis() + 2000;
+    Serial.println("[main] Force sync requested");
+}
+
 // The one callback every transport calls. Keep it fast — ESP-NOW's
 // version runs in Wi-Fi's internal task context, so no LVGL calls here.
 static void onSensorPacket(const SensorHealthPacket &pkt) {
@@ -73,22 +95,41 @@ void log_print(lv_log_level_t level, const char *buf) {
     Serial.flush();
 }
 
-// Touch input isn't used for any interactive widgets yet, but LVGL
-// still needs a read callback registered for the indev to be valid.
+// Touch input for the settings/detail screens and card/badge/banner
+// taps (Layer 6). Matches the check used in a known-working minimal
+// reference sketch — touched() alone, without also requiring
+// tirqTouched() (an IRQ-pin check that adds a dependency on IRQ
+// wiring/timing behaving exactly right, which the reference didn't
+// need to get working touch).
+//
+// The 200/3700/240/3800 map() range below is a generic reference
+// value, not measured on this specific physical panel — resistive
+// touch calibration varies unit to unit. If taps consistently land
+// off from where you actually touch, watch Serial while tapping the
+// four screen corners and note the raw X/Y each time; those four
+// numbers are what these map() ranges should actually be.
 void touchscreen_read(lv_indev_t *indev, lv_indev_data_t *data) {
-    if (touchscreen.tirqTouched() && touchscreen.touched()) {
+    if (touchscreen.touched()) {
         TS_Point p = touchscreen.getPoint();
         data->point.x = map(p.x, 200, 3700, 1, SCREEN_WIDTH);
         data->point.y = map(p.y, 240, 3800, 1, SCREEN_HEIGHT);
         data->state = LV_INDEV_STATE_PRESSED;
+
+        Serial.printf("[touch] raw=(%d,%d) mapped=(%d,%d)\n",
+                      p.x, p.y, data->point.x, data->point.y);
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
     }
 }
 
-// Touch temporarily disabled to isolate a hang — flip this to 1 once
-// the display is confirmed working without it.
-#define ENABLE_TOUCH 0
+// Root-caused against a known-working minimal reference sketch: that
+// sketch initializes the display (tft.init()) BEFORE touch's SPIClass
+// touches the same physical VSPI bus, and only calls lv_init() after
+// both. Our previous order had lv_init() first, then touch's SPI.begin(),
+// then the display last — touch claiming the shared bus before the
+// display had configured it. Reordering to match the proven-working
+// sequence: display first, touch second.
+#define ENABLE_TOUCH 1
 
 void setup() {
     Serial.begin(115200);
@@ -101,17 +142,12 @@ void setup() {
     pinMode(XPT2046_CS, OUTPUT);
     digitalWrite(XPT2046_CS, HIGH);
 
-    // --- LVGL ---
+    // --- LVGL core (no display/indev registered yet) ---
     lv_init();
     lv_log_register_print_cb(log_print);
 
-#if ENABLE_TOUCH
-    touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
-    touchscreen.begin(touchscreenSPI);
-    touchscreen.setRotation(2);
-#endif
-
-    // --- Display ---
+    // --- Display FIRST — must claim and configure the shared VSPI bus
+    //     before touch's SPIClass touches it at all. ---
     lv_display_t *disp = lv_tft_espi_create(SCREEN_WIDTH, SCREEN_HEIGHT, draw_buf, sizeof(draw_buf));
     lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90);
     // Disable LVGL's default theme entirely — without this it silently
@@ -120,6 +156,15 @@ void setup() {
     lv_display_set_theme(disp, NULL);
 
 #if ENABLE_TOUCH
+    // --- Touch SECOND, only after the display above is fully set up ---
+    touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+    touchscreen.begin(touchscreenSPI);
+    // Matches lv_display_set_rotation's LV_DISPLAY_ROTATION_90 above —
+    // previously this was set to 2 while the display used rotation 1
+    // (90°), a mismatch that wouldn't hang anything but could still
+    // have made taps land at the wrong screen location.
+    touchscreen.setRotation(1);
+
     lv_indev_t *indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, touchscreen_read);
@@ -184,6 +229,8 @@ void loop() {
         CydAckPacket ack;
         ack.cyd_uptime_ms = millis();
         ack.link_ok = havePacket ? 1 : 0;
+        ack.requested_cloud_backend = g_requestedCloudBackend;
+        ack.force_sync_requested = (millis() < g_forceSyncUntilMs) ? 1 : 0;
 
 #if USE_ESPNOW
         espnow_comms_send_ack(ack);

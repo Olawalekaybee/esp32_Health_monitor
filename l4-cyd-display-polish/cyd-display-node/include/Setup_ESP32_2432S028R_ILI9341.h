@@ -30,6 +30,9 @@
 #define LOAD_GFXFF
 #define SMOOTH_FONT
 
-#define SPI_FREQUENCY       40000000
-#define SPI_READ_FREQUENCY  20000000
-#define SPI_TOUCH_FREQUENCY  1000000
+// Matches a known-working minimal reference sketch's values exactly —
+// previously 40000000/1000000, changed here to remove any remaining
+// variable while debugging the touch hang.
+#define SPI_FREQUENCY        55000000
+#define SPI_READ_FREQUENCY   20000000
+#define SPI_TOUCH_FREQUENCY   2500000

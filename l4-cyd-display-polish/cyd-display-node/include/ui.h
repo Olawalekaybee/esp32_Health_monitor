@@ -24,3 +24,10 @@ void ui_update(const CommsPacket &pkt, bool haveEverReceivedPacket, bool linkSta
 // based on "any traffic in the last few seconds" so the indicator
 // naturally goes grey if the link drops.
 void ui_set_comms_status(const char *transportName, bool active);
+
+// Layer 6 (touch/settings): implemented in main.cpp, called from
+// ui.cpp's touch event handlers. ui.cpp owns rendering and touch;
+// main.cpp owns building the outgoing ack packet — these two
+// functions are the deliberate, narrow crossing point between them.
+void app_request_cloud_backend(uint8_t backend_id);
+void app_request_force_sync();

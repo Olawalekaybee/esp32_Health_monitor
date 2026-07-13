@@ -1,21 +1,10 @@
 #include "network_task.h"
 #include "config.h"
 #include <WiFi.h>
-
-// Backend selection lives in one place — see cloud/cloud_backend_select.h,
-// which also guards each backend .cpp's implementation so unselected
-// backends don't cause "multiple definition" linker errors.
-#include "cloud/cloud_backend_select.h"
-
-#if CLOUD_BACKEND_GOOGLE_SHEETS
-    #include "cloud/cloud_google_sheets.h"
-#elif CLOUD_BACKEND_FIREBASE
-    #include "cloud/cloud_firebase.h"
-#elif CLOUD_BACKEND_AWS
-    #include "cloud/cloud_aws.h"
-#endif
+#include "cloud/cloud_dispatch.h"
 
 static bool wifiConnected = false;
+static CloudBackendId currentBackend = DEFAULT_CLOUD_BACKEND;
 
 // Read-modify-write on statusQueue: peek whatever's there (another
 // task may have just updated a different field), overwrite only this
@@ -30,6 +19,7 @@ static void publishNetworkStatus(bool wifiOk, bool cloudOk) {
     xQueuePeek(statusQueue, &status, 0);
     status.wifi_connected = wifiOk;
     status.cloud_sync_ok = cloudOk;
+    status.active_cloud_backend = static_cast<uint8_t>(currentBackend);
     xQueueOverwrite(statusQueue, &status);
 }
 
@@ -53,6 +43,28 @@ static bool attemptConnect() {
     return false;
 }
 
+// Checks statusQueue for a backend switch request from the CYD's
+// settings screen. Only acts if it's both different from what's
+// currently running and a genuinely valid enum value — comms_task
+// relays whatever byte the CYD sent without validating it, so this is
+// the one place that actually matters.
+static void checkForBackendSwitch(const SystemStatus &status, bool &cloudReady, bool &lastCloudSyncOk) {
+    if (!cloud_backend_id_valid(status.requested_cloud_backend)) {
+        return;
+    }
+
+    CloudBackendId requested = static_cast<CloudBackendId>(status.requested_cloud_backend);
+    if (requested == currentBackend) {
+        return;
+    }
+
+    Serial.printf("[network_task] switching cloud backend: %s -> %s\n",
+                  cloud_backend_name(currentBackend), cloud_backend_name(requested));
+    currentBackend = requested;
+    cloudReady = cloud_dispatch_init(currentBackend);
+    lastCloudSyncOk = false; // haven't proven the new backend actually works yet
+}
+
 void networkTask(void *pvParameters) {
     if (!ENABLE_CLOUD_SYNC) {
         // Still worth publishing "no Wi-Fi, no cloud" rather than
@@ -67,10 +79,14 @@ void networkTask(void *pvParameters) {
     }
 
     wifiConnected = attemptConnect();
-    bool cloudReady = cloud_sync_init();
+    bool cloudReady = cloud_dispatch_init(currentBackend);
     bool lastCloudSyncOk = false;
 
     for (;;) {
+        SystemStatus status = {};
+        xQueuePeek(statusQueue, &status, 0);
+        checkForBackendSwitch(status, cloudReady, lastCloudSyncOk);
+
         if (WiFi.status() != WL_CONNECTED) {
             if (wifiConnected) {
                 Serial.println("[network_task] Wi-Fi connection lost");
@@ -93,13 +109,20 @@ void networkTask(void *pvParameters) {
                 bool haveSample = (xQueuePeek(sensorQueue, &sample, pdMS_TO_TICKS(200)) == pdTRUE);
                 bool haveHealth = (xQueuePeek(healthQueue, &health, 0) == pdTRUE);
                 if (haveSample && haveHealth) {
-                    lastCloudSyncOk = cloud_sync_send(sample, health);
+                    lastCloudSyncOk = cloud_dispatch_send(currentBackend, sample, health);
                 }
             }
         }
 
         publishNetworkStatus(wifiConnected, lastCloudSyncOk);
 
-        vTaskDelay(pdMS_TO_TICKS(wifiConnected ? CLOUD_SYNC_INTERVAL_MS : WIFI_RECONNECT_INTERVAL_MS));
+        // Layer 6 (touch/settings): blocking on the semaphore instead
+        // of a plain vTaskDelay means a force-sync tap on the CYD wakes
+        // this loop immediately (xSemaphoreTake returns pdTRUE), while
+        // an ordinary timeout (pdFALSE) falls through to the same
+        // periodic behavior as before — either way the loop just runs
+        // again from the top, no separate "do it now" code path needed.
+        xSemaphoreTake(forceSyncSemaphore,
+                       pdMS_TO_TICKS(wifiConnected ? CLOUD_SYNC_INTERVAL_MS : WIFI_RECONNECT_INTERVAL_MS));
     }
 }

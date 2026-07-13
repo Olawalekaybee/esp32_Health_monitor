@@ -45,6 +45,19 @@ struct SystemStatus {
     bool cloud_sync_ok;
     bool cyd_link_ok;      // last ESP-NOW send to CYD succeeded
     HealthStatus overall_health;
+
+    // Layer 6 (touch/settings): which cloud backend the CYD has asked
+    // for (set by comms_task from the CYD's ack, read by network_task),
+    // and which one network_task is actually dispatching to right now
+    // (the authoritative value, read by comms_task to report back to
+    // the CYD so its settings screen can show confirmed-active, not
+    // just requested). Values match CloudBackendId in cloud_dispatch.h;
+    // stored as uint8_t here since shared_types.h doesn't depend on
+    // that header. force-sync is a semaphore (see forceSyncSemaphore),
+    // not a status field — it needs to wake network_task immediately,
+    // which a polled mailbox field can't do without a busy-wait.
+    uint8_t requested_cloud_backend;
+    uint8_t active_cloud_backend;
 };
 
 // CommsPacket (the main-node -> CYD wire format) now lives in its
