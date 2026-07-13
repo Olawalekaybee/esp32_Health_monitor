@@ -344,6 +344,13 @@ static lv_obj_t *make_nav_header(lv_obj_t *parent, const char *title,
     lv_obj_set_style_bg_color(header, COLOR_TITLE_BAR, 0);
     lv_obj_set_style_bg_opa(header, LV_OPA_COVER, 0);
     lv_obj_add_flag(header, LV_OBJ_FLAG_CLICKABLE);
+    // Same reasoning as the gear button's extended click area: this
+    // sits right at the top edge, the least accurate zone on a
+    // resistive panel. Already full-width, so the only useful
+    // direction to extend is downward, giving a slightly-low tap a
+    // little more room to still register as "back" instead of
+    // falling through to whatever's just below the header.
+    lv_obj_set_ext_click_area(header, 12);
     lv_obj_add_event_cb(header, back_cb, LV_EVENT_CLICKED, NULL);
     add_press_feedback(header, lv_color_hex(0x232a35));
 
@@ -517,6 +524,13 @@ void ui_create(void) {
     lv_obj_align(gear_btn, LV_ALIGN_RIGHT_MID, -6, 0); // comms badge moved out of the title bar (now in the right side panel), so this no longer needs to share space with it
     lv_obj_set_style_bg_opa(gear_btn, LV_OPA_TRANSP, 0);
     lv_obj_add_flag(gear_btn, LV_OBJ_FLAG_CLICKABLE);
+    // Extends the CLICKABLE area beyond what's visually drawn — this
+    // sits right at the top-right corner, the single least accurate
+    // spot on a resistive panel (same edge-effect that motivated the
+    // touch debounce fix). A generous extra margin here means a
+    // slightly-off tap still lands on the gear icon instead of
+    // missing it and falling through to whatever's near it.
+    lv_obj_set_ext_click_area(gear_btn, 16);
     add_press_feedback(gear_btn, lv_color_hex(0x232a35));
     lv_obj_add_event_cb(gear_btn, on_gear_clicked, LV_EVENT_CLICKED, NULL);
 
@@ -550,6 +564,7 @@ void ui_create(void) {
     lv_obj_t *cloud_badge_container = nullptr;
     cloud_dot = make_status_icon_badge(left_panel, LV_SYMBOL_UPLOAD, &cloud_badge_container);
     lv_obj_add_flag(cloud_badge_container, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(cloud_badge_container, 10); // sits at the screen's left edge — same resistive-panel edge-accuracy concern as the gear button
     add_press_feedback(cloud_badge_container, lv_color_hex(0x232a35));
     lv_obj_add_event_cb(cloud_badge_container, on_cloud_badge_clicked, LV_EVENT_CLICKED, NULL);
 
@@ -577,6 +592,7 @@ void ui_create(void) {
     lv_obj_set_style_pad_all(dht_card, 10, 0);
     add_corner_brackets(screen, CENTER_X, CARD_Y, CARD_W, CARD_H, lv_palette_main(LV_PALETTE_CYAN));
     lv_obj_add_flag(dht_card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(dht_card, 6);
     add_press_feedback(dht_card, lv_color_hex(0x1c2430));
     lv_obj_add_event_cb(dht_card, on_dht_card_clicked, LV_EVENT_CLICKED, NULL);
 
@@ -642,6 +658,7 @@ void ui_create(void) {
     lv_obj_set_style_pad_all(ds_card, 10, 0);
     add_corner_brackets(screen, CENTER_X + CARD_W + CARD_GAP, CARD_Y, CARD_W, CARD_H, lv_palette_main(LV_PALETTE_CYAN));
     lv_obj_add_flag(ds_card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(ds_card, 6);
     add_press_feedback(ds_card, lv_color_hex(0x1c2430));
     lv_obj_add_event_cb(ds_card, on_ds_card_clicked, LV_EVENT_CLICKED, NULL);
 
@@ -693,6 +710,7 @@ void ui_create(void) {
     lv_obj_set_style_shadow_opa(status_banner, LV_OPA_20, 0);
     add_corner_brackets(screen, CENTER_X, BANNER_Y, CENTER_W, BANNER_H, lv_palette_main(LV_PALETTE_CYAN));
     lv_obj_add_flag(status_banner, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(status_banner, 8); // sits at the screen's bottom edge
     add_press_feedback(status_banner, lv_color_hex(0x1c2430));
     lv_obj_add_event_cb(status_banner, on_banner_clicked, LV_EVENT_CLICKED, NULL);
 

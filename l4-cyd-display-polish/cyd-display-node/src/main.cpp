@@ -49,6 +49,17 @@ SPIClass touchscreenSPI = SPIClass(VSPI);
 XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
 
 #define DRAW_BUF_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 10 * (LV_COLOR_DEPTH / 8))
+
+// pins.h's SCREEN_WIDTH/SCREEN_HEIGHT (240x320) are the panel's
+// PRE-rotation native dimensions — correct for lv_tft_espi_create()
+// below, which is rotated 90° afterward. Touch coordinates need the
+// POST-rotation LOGICAL dimensions instead (320x240) — using
+// SCREEN_WIDTH/SCREEN_HEIGHT directly in touchscreen_read() was
+// exactly backwards, and the actual root cause of every "calibration"
+// mismatch traced through several rounds of debugging: X was being
+// computed and clamped against 240, not 320.
+#define TOUCH_LOGICAL_WIDTH  320
+#define TOUCH_LOGICAL_HEIGHT 240
 uint32_t draw_buf[DRAW_BUF_SIZE / 4];
 
 // --- Shared comms state, fed by whichever transport(s) are active ---
@@ -114,38 +125,41 @@ void touchscreen_read(lv_indev_t *indev, lv_indev_data_t *data) {
     // the first few ms right at initial contact, before the resistive
     // layers fully settle against each other — this is a real, well
     // documented characteristic of the hardware, not a calibration
-    // bug. Diagnostic logs showed exactly this: a correct click
-    // firing on the right widget, while the printed coordinate from
-    // later in the same gesture looked like it was somewhere else
-    // entirely. Skipping the very first sample of each new touch-down
-    // (reporting RELEASED for it, then trusting the very next sample)
-    // costs one LVGL read cycle of latency — imperceptible — and lets
-    // the reading settle before it's used for anything.
-    static bool wasTouched = false;
-
+    // bug.
+    //
+    // An earlier version of this fix discarded the first sample and
+    // waited for LVGL's *next* poll cycle (~30ms later) to trust a
+    // reading — but a tap brief enough to release before that next
+    // poll happens would never get a valid press reported at all,
+    // silently dropping the tap entirely rather than just delaying
+    // it. That's a real regression this caused: a short, light tap
+    // (e.g. on a small text link) is exactly the kind of touch likely
+    // to be that brief. Settling the reading here, within the same
+    // call, guarantees a real reading is used regardless of how brief
+    // the physical contact is or how it lines up with the poll timer.
     if (touchscreen.touched()) {
-        if (!wasTouched) {
-            // First sample of a brand-new touch-down — discard it.
-            wasTouched = true;
-            data->state = LV_INDEV_STATE_RELEASED;
-            return;
-        }
-
+        delay(3); // let the resistive layers settle before trusting the reading
         TS_Point p = touchscreen.getPoint();
-        int16_t x = map(p.x, 3728, 401, 1, SCREEN_WIDTH);
-        int16_t y = map(p.y, 590, 3526, 1, SCREEN_HEIGHT);
+        // X-axis recalibrated again (2026-07-13, second pass) using
+        // BOTH live reference points together — gear icon (raw~3505,
+        // should map to ~300) and "Back" label (raw~532, should map
+        // to ~35) — verified by direct computation to land exactly
+        // on both: forward-checked in Python using Arduino's actual
+        // integer map() semantics before writing this, not just
+        // algebra on paper.
+        int16_t x = map(p.x, 150, 3729, 1, TOUCH_LOGICAL_WIDTH);
+        int16_t y = map(p.y, 590, 3526, 1, TOUCH_LOGICAL_HEIGHT);
         // map() extrapolates rather than clips when the raw reading
         // falls slightly outside the calibrated min/max (easy to hit
         // right at a screen edge) — clamp so LVGL never gets a
         // coordinate outside the actual screen.
-        data->point.x = constrain(x, 1, SCREEN_WIDTH);
-        data->point.y = constrain(y, 1, SCREEN_HEIGHT);
+        data->point.x = constrain(x, 1, TOUCH_LOGICAL_WIDTH);
+        data->point.y = constrain(y, 1, TOUCH_LOGICAL_HEIGHT);
         data->state = LV_INDEV_STATE_PRESSED;
 
         Serial.printf("[touch] raw=(%d,%d) mapped=(%d,%d)\n",
                       p.x, p.y, data->point.x, data->point.y);
     } else {
-        wasTouched = false;
         data->state = LV_INDEV_STATE_RELEASED;
     }
 }
@@ -163,6 +177,7 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("\n=== CYD Display Node boot ===");
+    Serial.println("=== BUILD MARKER: calibration v3 (150,3729) ===");
 
     // Even with touch disabled, its CS pin sits on the same SPI bus as
     // the display. Left floating, it can partially respond and corrupt
