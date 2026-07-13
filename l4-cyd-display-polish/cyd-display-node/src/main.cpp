@@ -110,7 +110,27 @@ void log_print(lv_log_level_t level, const char *buf) {
 // generic reference sketch's assumption — a real difference on this
 // unit, not a guess. Edge values below are the average of each pair.
 void touchscreen_read(lv_indev_t *indev, lv_indev_data_t *data) {
+    // Resistive touch panels commonly read noisy/unsettled values for
+    // the first few ms right at initial contact, before the resistive
+    // layers fully settle against each other — this is a real, well
+    // documented characteristic of the hardware, not a calibration
+    // bug. Diagnostic logs showed exactly this: a correct click
+    // firing on the right widget, while the printed coordinate from
+    // later in the same gesture looked like it was somewhere else
+    // entirely. Skipping the very first sample of each new touch-down
+    // (reporting RELEASED for it, then trusting the very next sample)
+    // costs one LVGL read cycle of latency — imperceptible — and lets
+    // the reading settle before it's used for anything.
+    static bool wasTouched = false;
+
     if (touchscreen.touched()) {
+        if (!wasTouched) {
+            // First sample of a brand-new touch-down — discard it.
+            wasTouched = true;
+            data->state = LV_INDEV_STATE_RELEASED;
+            return;
+        }
+
         TS_Point p = touchscreen.getPoint();
         int16_t x = map(p.x, 3728, 401, 1, SCREEN_WIDTH);
         int16_t y = map(p.y, 590, 3526, 1, SCREEN_HEIGHT);
@@ -125,6 +145,7 @@ void touchscreen_read(lv_indev_t *indev, lv_indev_data_t *data) {
         Serial.printf("[touch] raw=(%d,%d) mapped=(%d,%d)\n",
                       p.x, p.y, data->point.x, data->point.y);
     } else {
+        wasTouched = false;
         data->state = LV_INDEV_STATE_RELEASED;
     }
 }
