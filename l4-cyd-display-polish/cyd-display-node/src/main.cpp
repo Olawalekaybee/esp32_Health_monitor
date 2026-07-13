@@ -102,17 +102,24 @@ void log_print(lv_log_level_t level, const char *buf) {
 // wiring/timing behaving exactly right, which the reference didn't
 // need to get working touch).
 //
-// The 200/3700/240/3800 map() range below is a generic reference
-// value, not measured on this specific physical panel — resistive
-// touch calibration varies unit to unit. If taps consistently land
-// off from where you actually touch, watch Serial while tapping the
-// four screen corners and note the raw X/Y each time; those four
-// numbers are what these map() ranges should actually be.
+// Calibrated against this specific physical panel via a four-corner
+// raw-coordinate test (2026-07-13):
+//   top-left     raw=(3745, 520)    top-right    raw=(433, 659)
+//   bottom-left  raw=(3710, 3614)   bottom-right raw=(369, 3437)
+// X is inverted (raw X decreases left-to-right) relative to the
+// generic reference sketch's assumption — a real difference on this
+// unit, not a guess. Edge values below are the average of each pair.
 void touchscreen_read(lv_indev_t *indev, lv_indev_data_t *data) {
     if (touchscreen.touched()) {
         TS_Point p = touchscreen.getPoint();
-        data->point.x = map(p.x, 200, 3700, 1, SCREEN_WIDTH);
-        data->point.y = map(p.y, 240, 3800, 1, SCREEN_HEIGHT);
+        int16_t x = map(p.x, 3728, 401, 1, SCREEN_WIDTH);
+        int16_t y = map(p.y, 590, 3526, 1, SCREEN_HEIGHT);
+        // map() extrapolates rather than clips when the raw reading
+        // falls slightly outside the calibrated min/max (easy to hit
+        // right at a screen edge) — clamp so LVGL never gets a
+        // coordinate outside the actual screen.
+        data->point.x = constrain(x, 1, SCREEN_WIDTH);
+        data->point.y = constrain(y, 1, SCREEN_HEIGHT);
         data->state = LV_INDEV_STATE_PRESSED;
 
         Serial.printf("[touch] raw=(%d,%d) mapped=(%d,%d)\n",
